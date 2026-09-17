@@ -23,7 +23,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node --check src/plugin.mjs && node test/run-tests.mjs && node test/planner-tests.mjs && node test/hook-tests.mjs && node --import ./test/stub-loader.mjs test/plugin-tests.mjs"
+    "test": "node --check src/plugin.mjs && node test/run-tests.mjs && node test/planner-tests.mjs && node test/search-tests.mjs && node test/hook-tests.mjs && node --import ./test/stub-loader.mjs test/plugin-tests.mjs"
   },
   "keywords": [
     "memory",

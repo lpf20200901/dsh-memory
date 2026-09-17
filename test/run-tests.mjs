@@ -336,6 +336,41 @@ section('M2：mem set 修改已有条目');
   check('expired 条目不再参与注入', JSON.parse(run(['inject', '--root', root, '--json']).out).entries.length === 0);
 }
 
+/* --------------------------------------------------------------- 检索排序 */
+section('recall：相关度排序 / 中文 bigram / 分层过滤');
+{
+  const root = freshRoot('search');
+  run(['init', '--root', root, '--scope', 'workspace:x']);
+
+  // 结论里带关键词的（强命中）
+  run(['new', '--root', root, '--type', 'fact', '--id', 'pipe-fact', '--key', 'no-pipe', '--conclusion', '沙箱禁止命名管道，要重定向到文件', '--source', 's']);
+  run(['promote', '--root', root, 'pipe-fact']);
+  // 只在理由里提一句的（弱命中：命中数够过阈值，但分数远低于结论命中）
+  run(['new', '--root', root, '--type', 'fact', '--id', 'weak-fact', '--conclusion', '另一个无关结论', '--reason', '顺便提一句沙箱与管道', '--source', 's']);
+  run(['promote', '--root', root, 'weak-fact']);
+  run(['journal', 'add', '--root', root, '今天又踩了一次管道的坑，记一笔']);
+  run(['index', '--root', root]);
+
+  const r = run(['recall', '--root', root, '沙箱禁管道']);
+  check('中文连写能命中（老实现必然落空）', r.code === 0 && r.out.includes('pipe-fact'), flat(r.out));
+  const ordered = JSON.parse(run(['recall', '--root', root, '沙箱禁管道', '--json']).out);
+  check('结论命中排在理由命中前面', ordered.matches.length === 2 && ordered.matches[0].id === 'pipe-fact', JSON.stringify(ordered.matches.map((m) => `${m.id}:${m.score}`)));
+  check('分数确实拉开了', ordered.matches[0].score > ordered.matches[1].score, JSON.stringify(ordered.matches.map((m) => m.score)));
+  check('结果带命中片段与分数', /score \d/.test(r.out), flat(r.out));
+  check('流水行也能被检索到', run(['recall', '--root', root, '管道的坑']).out.includes('journal:'), flat(run(['recall', '--root', root, '管道的坑']).out));
+
+  const only = run(['recall', '--root', root, '管道', '--where', 'facts']);
+  check('--where facts 排除流水层', !only.out.includes('journal:'), flat(only.out));
+  check('--where index 能单独搜派生索引', run(['recall', '--root', root, '管道', '--where', 'index']).out.includes('index:'), '');
+
+  const j = JSON.parse(run(['recall', '--root', root, '沙箱禁管道', '--json']).out);
+  check('--json 是合法结构化结果', j.query === '沙箱禁管道' && Array.isArray(j.matches) && j.matches[0].id === 'pipe-fact', flat(JSON.stringify(j).slice(0, 160)));
+  check('--json 每条带 score/matched/snippet', typeof j.matches[0].score === 'number' && Array.isArray(j.matches[0].matched) && !!j.matches[0].snippet, JSON.stringify(j.matches[0]).slice(0, 160));
+
+  const none = run(['recall', '--root', root, '数据库迁移方案']);
+  check('搜不到时不硬凑结果', /没有匹配/.test(none.out), flat(none.out));
+}
+
 /* ------------------------------------------------------------- 汇总 */
 rmrf(SANDBOX);
 console.log(`\n${pass} 通过 / ${fail} 失败`);

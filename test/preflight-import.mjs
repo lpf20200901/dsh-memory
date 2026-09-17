@@ -6,8 +6,14 @@
  * 跑法（用 DSH 自带的 node）：
  *   <DSH_HOME>\.desktop-bin\node.cmd <profile>\node_modules\dsh-memory\test\preflight-import.mjs
  *
+ * ⚠️ 在 DSH 沙箱里跑时，默认的 store（插件目录下的 .preflight-store）在工作区之外，
+ * 建目录会被拒（EPERM）。这时把 store 指到工作区/临时目录里：
+ *   $env:MEM_PREFLIGHT_ROOT = 'D:\path\to\workspace\.preflight-store\memory'
+ *
  * 退出码 0 = 预检通过；非 0 = 有问题，**此时不要把它加进 profile**。
  */
+
+import { fileURLToPath } from 'node:url';
 
 const results = [];
 let failed = 0;
@@ -16,7 +22,9 @@ function check(name, ok, detail = '') {
   if (!ok) failed += 1;
 }
 
-const here = new URL('.', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1');
+// 必须用 fileURLToPath：`new URL(...).pathname` 会把非 ASCII 用户名百分号编码
+// （C:\Users\李鹏飞 → C:\Users\%E6%9D%8E%E9%B9%8F%E9%A3%9E），路径就废了。
+const here = fileURLToPath(new URL('.', import.meta.url));
 const storeRoot = process.env.MEM_PREFLIGHT_ROOT || `${here}.preflight-store/memory`;
 
 try {

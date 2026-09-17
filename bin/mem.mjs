@@ -18,6 +18,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 import { renderBaseline } from '../src/planner.mjs';
+import { findMatches, rankDocs } from '../src/search.mjs';
 
 const VERSION = '0.1.0';
 const CONFIG_FILE = 'memory.config.json';
@@ -664,32 +665,88 @@ function cmdInject(opts) {
   }
 }
 
+/**
+ * 把记忆库摊平成「可检索文档」列表。
+ *
+ * `mem recall`（人用）与插件 `memory_search`（模型用）**共用这一个**，
+ * 两条检索路径的结果才不会有差异（历史教训：同一个"搜索"曾经有两份实现）。
+ *
+ * @param {object} L ensureLayout 的结果
+ * @param {{where?: string}} [opts] all | facts | decisions | inbox | archive | journal | sessions | index
+ */
+function collectDocs(L, { where = 'all' } = {}) {
+  const want = where || 'all';
+  const keep = (w) => want === 'all' || want === w;
+  const docs = [];
+
+  for (const e of readAll(L)) {
+    if (e.error || !keep(e.where)) continue;
+    docs.push({
+      id: e.id,
+      where: e.where,
+      type: e.data.type,
+      status: e.data.status,
+      key: e.data.key || null,
+      tags: e.data.tags || [],
+      date: e.data.date || '',
+      conclusion: firstLine(e.body),
+      text: e.body,
+    });
+  }
+
+  // 流水 / 会话索引 / 条目索引：逐行当文档，这样"我在哪次会话聊过 X"也能检索。
+  // index.md 是条目的**派生视图**，默认不参与（否则每条记忆都会重复命中一次），
+  // 想看它得显式 `--where index`。
+  for (const [layer, file] of [['journal', L.journal], ['sessions', path.join(L.root, 'sessions.md')], ['index', L.index]]) {
+    if (!keep(layer) || (layer === 'index' && want !== 'index') || !fs.existsSync(file)) continue;
+    fs.readFileSync(file, 'utf8')
+      .split(/\r?\n/)
+      .forEach((raw, i) => {
+        const line = raw.trim();
+        if (!line || line.startsWith('#') || line.startsWith('---') || /^[a-z_]+:\s/i.test(line)) return;
+        docs.push({ id: `${layer}:${i + 1}`, where: layer, conclusion: line, text: line });
+      });
+  }
+
+  return docs;
+}
+
+/** 把片段里的关键词标色 —— 扫结果时这一步最省事。 */
+function highlight(text, tokens) {
+  const spans = findMatches(text, tokens);
+  if (!spans.length) return text;
+  let out = '';
+  let at = 0;
+  for (const s of spans) {
+    out += text.slice(at, s.start) + c(33, text.slice(s.start, s.end));
+    at = s.end;
+  }
+  return out + text.slice(at);
+}
+
 function cmdRecall(opts) {
   const root = resolveRoot(opts.root);
   const L = ensureLayout(root, { create: false });
-  const kw = (opts._[0] || '').toLowerCase();
-  if (!kw) fail('用法：mem recall <关键词> [--all]');
-  const hits = [];
-  for (const e of readAll(L)) {
-    const text = `${e.id}\n${JSON.stringify(e.data)}\n${e.body}`.toLowerCase();
-    if (text.includes(kw)) hits.push({ where: e.where, id: e.id, line: firstLine(e.body) });
-  }
-  for (const f of ['journal.md', 'sessions.md', 'index.md']) {
-    const p = path.join(root, f);
-    if (!fs.existsSync(p)) continue;
-    const lines = fs.readFileSync(p, 'utf8').split(/\r?\n/);
-    lines.forEach((l, i) => {
-      if (l.toLowerCase().includes(kw)) hits.push({ where: f, id: `:${i + 1}`, line: l.trim().slice(0, 120) });
-    });
-  }
-  if (!hits.length) {
-    console.log(dim(`（没有匹配 "${kw}"）`));
+  const query = String(opts._[0] || '').trim();
+  if (!query) fail('用法：mem recall <关键词> [--where all|facts|decisions|inbox|archive|journal|sessions|index] [--limit N] [--json]');
+
+  const docs = collectDocs(L, { where: typeof opts.where === 'string' ? opts.where : 'all' });
+  const hits = rankDocs(docs, query, { limit: opts.limit ? Number(opts.limit) : 20 });
+
+  if (opts.json) {
+    console.log(JSON.stringify({ query, total: hits.length, matches: hits }, null, 2));
     return;
   }
-  for (const h of hits.slice(0, opts.limit ? Number(opts.limit) : 50)) {
-    console.log(`${c(36, String(h.where).padEnd(10))} ${c(1, h.id).padEnd(34)} ${h.line}`);
+  if (!hits.length) {
+    console.log(dim(`（没有匹配 "${query}" 的记忆或流水）`));
+    console.log(dim('  换个说法，或拆成几个关键词再试 —— 中文连写会自动切 bigram，不用手动加空格。'));
+    return;
   }
-  console.log(dim(`\n命中 ${hits.length} 处`));
+  for (const h of hits) {
+    console.log(`${c(36, String(h.where).padEnd(9))} ${c(1, h.id.padEnd(34))} ${dim(`score ${h.score.toFixed(1)}`)}`);
+    console.log(`    ${highlight(h.snippet, h.matched)}`);
+  }
+  console.log(dim(`\n命中 ${hits.length} 条（按相关度排序；--json 可机器读）`));
 }
 
 /* ------------------------------------------------------------- validate */
@@ -913,6 +970,7 @@ export {
   readAll,
   findById,
   activeEntries,
+  collectDocs,
   entryHash,
   injectPayload,
   renderInject,
@@ -946,7 +1004,9 @@ function usage() {
   inject [--budget <字节>] [--json]  渲染"应注入的内容"并核对预算
                           --json 输出带 per-entry hash 的结构化载荷（差分注入用）
   journal add "内容"       追加流水（不注入）
-  recall <关键词> [--limit N]
+  recall <关键词> [--where <层>] [--limit N] [--json]
+                           相关度排序检索；中文自动切 bigram，结果带命中片段
+                           --where：all（默认）| facts | decisions | inbox | archive | journal | sessions | index
 
 根目录解析：--root > $DSH_MEMORY_ROOT > <cwd>/memory`);
 }

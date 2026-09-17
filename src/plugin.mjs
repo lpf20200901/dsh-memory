@@ -15,9 +15,10 @@ import path from 'node:path';
 import z from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
-import { createEntry, ensureLayout, injectPayload, loadConfig, readAll } from '../bin/mem.mjs';
+import { collectDocs, createEntry, ensureLayout, injectPayload, loadConfig } from '../bin/mem.mjs';
 import { createMemoryHook } from './hook.mjs';
 import { MEMORY_SOURCE_KIND } from './planner.mjs';
+import { rankDocs } from './search.mjs';
 
 export const name = 'memory';
 export const inject = ['tools'];
@@ -89,17 +90,18 @@ export function apply(ctx, config = {}) {
       name: 'memory_search',
       description:
         'Search the project long-term memory (dsh-memory): confirmed facts, decisions, the journal, ' +
-        'and the inbox of pending candidates. Use it when the user refers to past decisions, ' +
-        'conventions, or "we already figured this out". Returns matching entries with ids.',
+        'the session index, and the inbox of pending candidates. Use it when the user refers to past ' +
+        'decisions, conventions, or "we already figured this out". Results are ranked by relevance and ' +
+        'each carries a snippet; Chinese queries are matched by bigram, so no need to add spaces.',
       parameters: {
         query: {
           type: 'string',
           required: true,
-          description: 'Case-insensitive substring to look for (id, conclusion, key, tags, or journal text).',
+          description: 'Keywords to look for (id, conclusion, key, tags, journal text). Chinese works without spaces.',
         },
         where: {
           type: 'string',
-          enum: ['all', 'facts', 'decisions', 'inbox', 'archive', 'journal'],
+          enum: ['all', 'facts', 'decisions', 'inbox', 'archive', 'journal', 'sessions', 'index'],
           description: 'Narrow the search to one layer. Default all.',
         },
         limit: { type: 'integer', description: 'Max matches to return. Default 20.' },
@@ -123,6 +125,9 @@ export function apply(ctx, config = {}) {
                   status: { type: 'string' },
                   key: { type: 'string' },
                   line: { type: 'string', required: true },
+                  snippet: { type: 'string' },
+                  score: { type: 'number' },
+                  matched: { type: 'array', items: { type: 'string' } },
                 },
               },
             },
@@ -138,42 +143,26 @@ export function apply(ctx, config = {}) {
       execute(args, exec) {
         const store = storeOf(exec?.agent?.session?.header?.cwd);
         if (!store) return Promise.resolve({ total: 0, matches: [] });
-        const needle = String(args.query ?? '').toLowerCase();
         const limit = Number.isFinite(args.limit) ? Number(args.limit) : 20;
         const want = args.where ?? 'all';
-        const matches = [];
 
-        const whereOf = (e) => e.where;
-        for (const e of readAll(store.L)) {
-          if (want !== 'all' && want !== 'journal' && whereOf(e) !== want) continue;
-          const hay = [e.id, e.data?.type, e.data?.key, (e.data?.tags ?? []).join(' '), e.body].join('\n').toLowerCase();
-          if (!hay.includes(needle)) continue;
-          const line = String(e.body ?? '')
-            .split(/\r?\n/)
-            .map((l) => l.trim())
-            .find((l) => l && !l.startsWith('#'));
-          matches.push({
-            id: e.id,
-            where: e.where,
-            type: e.data?.type,
-            status: e.data?.status,
-            key: e.data?.key ?? undefined,
-            line: truncated(line, 240),
-          });
-        }
+        // 检索逻辑与 `mem recall` 完全共用（src/search.mjs）：分词、打分、片段只有一份实现
+        const docs = collectDocs(store.L, { where: want });
+        const hits = rankDocs(docs, args.query, { limit });
 
-        if (want === 'all' || want === 'journal') {
-          const journal = path.join(store.root, 'journal.md');
-          if (fs.existsSync(journal)) {
-            for (const [i, line] of fs.readFileSync(journal, 'utf8').split(/\r?\n/).entries()) {
-              if (line.toLowerCase().includes(needle)) {
-                matches.push({ id: `journal:${i + 1}`, where: 'journal', line: truncated(line, 240) });
-              }
-            }
-          }
-        }
+        const matches = hits.map((h) => ({
+          id: h.id,
+          where: h.where,
+          type: h.type,
+          status: h.status,
+          key: h.key ?? undefined,
+          line: truncated(h.line, 240),
+          snippet: truncated(h.snippet, 240),
+          score: Number(h.score.toFixed(2)),
+          matched: h.matched,
+        }));
 
-        return Promise.resolve({ total: matches.length, matches: matches.slice(0, limit) });
+        return Promise.resolve({ total: matches.length, matches });
       },
       presentCall: (args) => ({ card: 'generic', title: `Search memory: ${truncated(args.query, 60)}`, kind: 'other', rawInput: args }),
     }),

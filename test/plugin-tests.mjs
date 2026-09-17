@@ -206,6 +206,15 @@ const toolAgent = fakeAgent(cwdOfProject, 'session-tool');
   const journalLine = await searchTool.execute({ query: '流水一行' }, { agent: toolAgent });
   check('memory_search 覆盖 journal（本轮没写则为 0）', journalLine.total === 0 || journalLine.matches.some((m) => m.where === 'journal'), JSON.stringify(journalLine.total));
 
+  // 中文连写检索：查询不带空格也要命中（bigram 分词）—— 老实现（纯子串）这里必然落空
+  const zh = await searchTool.execute({ query: '沙箱禁管道' }, { agent: toolAgent });
+  check('memory_search 支持中文连写检索', zh.matches.some((m) => m.id === 'new-fact'), JSON.stringify(zh).slice(0, 200));
+  check('memory_search 结果带 score 与 snippet', typeof zh.matches[0]?.score === 'number' && !!zh.matches[0]?.snippet, JSON.stringify(zh.matches[0] ?? {}).slice(0, 200));
+
+  // --where 收窄到 facts：inbox 里的候选不应该出现
+  const factsOnly = await searchTool.execute({ query: '沙箱禁管道', where: 'facts' }, { agent: toolAgent });
+  check('where=facts 只返回事实层', factsOnly.matches.length > 0 && factsOnly.matches.every((m) => m.where === 'facts'), JSON.stringify(factsOnly.matches.map((m) => m.where)));
+
   const rendered = searchTool.output.render({}, none);
   check('无可渲染输出时不炸', Array.isArray(rendered) && typeof rendered[0].text === 'string', JSON.stringify(rendered));
 }
