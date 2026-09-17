@@ -1,0 +1,229 @@
+# 记忆系统的设计与演进（讨论稿）
+
+> 状态：**讨论中**（2026-09-17 起）。本文件是"最上层记忆"的落点：记录设计决策、理由、被否决的方案与开放问题。
+> 目标产品：`dsh-memory` —— 一个可独立使用的 CLI + 一个 DSH 插件，开源到 GitHub（主）/ Gitee（镜像）。
+
+---
+
+## 一、要解决的问题（真实痛点，都实测过）
+
+1. **新会话不记得任何事** —— 已经解决主链：DSH 的 `dsh-agent-instructions` 插件会注入
+   `$DSH_HOME/AGENTS.md`（跨工作区）+ `<工作区>/AGENTS.md`（工作区）+ `AGENTS.local.md`（私有叠加层）。已实测生效。
+2. **注入没有差分** —— 文件一变，插件就把**整篇**重新注入。实测：一个会话里改 15 次 `AGENTS.local.md`
+   （8.5 KB）≈ **58k tokens** 白烧。这是要解决的头号成本问题。
+3. **信息集中在一两个文件里必然膨胀** —— 待办、结论、流水全塞一个文件，早晚几万字，
+   既贵又难检索，还会互相淹没重点。
+4. **记忆会腐化** —— 结论会过时、会被推翻，但旧条目没人删。追加式日志解决不了"当前真相是什么"。
+5. **跨工作区/跨项目** —— 有些知识是全局的（账号、机器环境、用户偏好），有些是项目私有的。
+   现在靠"全局 AGENTS.md vs 工作区 AGENTS.md"两级硬编码，粒度太粗。
+6. **OpenSpec 类的工具（用户在公司用）解决了"代码不跑偏"，但没解决"结论不用重复交代"** ——
+   因为它是**拉取式**（pull：靠指令要求 AI 去读 `openspec/`），新会话不会主动想起。
+   我们的强项恰好是**推送式**（push：会话开始自动注入）。两者应该合起来。
+
+---
+
+## 二、借鉴 OpenSpec 的哪些机制
+
+参考：[Fission-AI/OpenSpec](https://github.com/Fission-AI/OpenSpec)（MIT，"Spec-driven development for AI coding assistants"）。
+
+它的核心结构：`openspec/specs/`（**当前真相**：Requirement + Scenario，WHEN/THEN 格式）
+＋ `openspec/changes/<id>/`（**待生效的变更集**：proposal.md / specs/ 增量 / design.md / tasks.md）
+＋ 工作流 **propose → apply → archive**（archive 把增量**合并进 specs** 并把变更集移到 `changes/archive/<日期>-<名字>/`）。
+
+值得搬过来的四个机制：
+
+| OpenSpec 机制 | 搬到记忆里的形态 | 解决我们的什么问题 |
+| --- | --- | --- |
+| `specs/` = 当前真相 | **当前事实层**：只保留"现在成立"的结论，每条带 `status` | 记忆腐化（问题 4） |
+| `changes/` = 待生效增量 | **收件箱层**：新结论先落 inbox，未确认的不进常驻 | 误记/未验证结论污染常驻层 |
+| **archive = 合并 + 日期归档** | 确认后：写入事实层、旧条目标 `superseded-by`、原文进归档 | 有历史可追溯，但当前真相干净 |
+| **`validate` 校验** | `memory validate`：格式、索引一致性、悬空引用、未解决冲突 | 记忆库长期不腐坏 |
+
+另外它那两个"工程化"细节也值得抄：**纯 Markdown、无专有格式**（人可读、可 git diff、可 review、
+能像代码一样提交 —— 正好接上用户已有的 Gitee/GitHub 工作流）、以及 **Stores（beta）= 把规划放到独立仓库
+共享给多个仓库/团队** —— 这就是"跨工作区记忆"的产品化形态。
+
+---
+
+## 三、分层设计（三层 + 两条通道）
+
+```
+        ┌─ PUSH：会话开始自动注入（字节预算硬约束，目标 < 3 KB）
+        │    T0 身份与约定     ：用户偏好、机器环境、账号/发布约定  ← $DSH_HOME 级
+        │    T1 索引与待办     ：本次要接着办什么 + 记忆库目录索引
+        │
+记忆库 ─┤
+        └─ PULL：按需检索（不占常驻预算，靠工具或 grep）
+             T2 事实层 facts/     ：当前成立的结论（status: active / superseded / expired）
+             T3 决策层 decisions/ ：为什么这么定 + 被否决的方案（ADR 风格，只增不改）
+             T4 收件箱 inbox/     ：候选条目，等确认 → 合并进 facts/ 或 decisions/
+             T5 流水 journal/     ：逐次会话的时间线（可无限增长，永不注入）
+             T6 原始存档 sessions/：DSH 会话日志解压后的可检索副本（已有工具）
+```
+
+**关键约束（来自问题 2）**：只有 T0/T1 进注入范围。T2 及以上一律不注入，靠
+"索引 + 检索工具"按需拉取。这样流水再长、事实再多，也不会变成每次会话的固定开销。
+
+**关键约束（来自问题 4）**：T2 的条目**有状态**。注入时只渲染 `active`；
+新结论覆盖旧结论时，把旧的标 `superseded-by: <新条目 id>`，而不是删掉或无限追加。
+
+---
+
+## 四、插件形态（`dsh-memory`）
+
+以现有插件 `@deepseek-ai/dsh-agent-instructions` 为参考实现（它的 seam 已确认可用：
+`agent/pre-step` 监听 + inbox 组合 + 基于 fs touch 的刷新 + digest 去重 + 字节预算截断 + `</system-reminder>` 转义）。
+我们的插件**不替换它**，而是与它共存/接在它之上：
+
+| 能力 | 说明 |
+| --- | --- |
+| **注入（含差分）** | 会话首步注入 T0+T1；此后**只注入变化块**（planner 记住上次注入的条目 id + digest，做集合差），彻底解决"没有差分" |
+| `memory_search` | 跨 T2~T5 检索（Markdown 全文 + frontmatter 过滤：tag/scope/status/日期） |
+| `memory_write` | 结构化写入（schema 校验：id、日期、scope、status、来源），默认落 inbox |
+| `memory_promote` | inbox → facts / decisions 的合并（含 superseded 标记），对应 OpenSpec 的 archive |
+| `memory_validate` | 校验：格式、索引一致性、悬空引用、未解决的冲突、体积预算 |
+| 会话结束钩子 | 提示/自动把本次会话蒸馏成候选条目（落 inbox，不直接改事实层） |
+| CLI | `memory.mjs`（今天的雏形）独立可用，插件只是它的"在线部分" |
+
+仓库结构（草案）：
+
+```
+dsh-memory/
+├── package.json / cordis.yml    插件清单（参考 dsh-agent-instructions）
+├── src/{index,store,inject,index-builder,validate,tools}.ts
+├── bin/memory.mjs               CLI（可与插件分离发布）
+├── docs/{design,layering,open-spec-comparison}.md
+├── openspec/                    ← 用 OpenSpec 管这个项目自己（吃自己的狗粮）
+└── tests/
+```
+
+---
+
+## 五、已定决策（2026-09-17）
+
+| # | 决策 | 理由 |
+| --- | --- | --- |
+| **D1** | **scope（全局/工作区）+ tags（主题）两维** | scope 只回答"这条该不该注入"，tags 只回答"想找的时候能不能搜到" —— 两个问题分开问，逻辑不打架 |
+| **D2** | **模型只能写收件箱；事实层的提升需要确认** | 防止错误结论静默进入常驻层、然后被**反复注入** —— 注入本身有成本，错的东西代价更高 |
+| **D3** | **先做 CLI + 结构化条目 + validate；插件是很薄的一层** | 数据模型和校验最值得先想清楚；CLI 可独立开源、可测试、不依赖 DSH。避免数据模型被插件实现绑架 |
+| **D4** | **只借鉴 OpenSpec 的思想，不做桥接** | 先把自己的分层做封闭，不被别人的格式与 roadmap 约束；将来要加桥也不亏 |
+| **D5** | **记忆库 root 可配置，默认 `<工作区>/memory/`** | 不强制、不惊喜；同时给"独立记忆仓"留好口子（`--root` / `DSH_MEMORY_ROOT`）。与现有 `memory/` 目录兼容，零迁移 |
+
+### 仍未定
+
+- **条目 id 方案**：暂定 `YYYY-MM-DD-<slug>`（可读、可手写、冲突时加后缀）；若将来需要内容寻址再换
+- 现存 `journal.md` 与 `sessions.md` 是否迁移成结构化条目（倾向：**journal 不迁**，它是流水；`sessions.md` 保持自动生成）
+
+（已答但保留备查）冲突检测靠结构化字段（同 key + 显式 `--supersedes`），不靠模型自由判断；检索先用零依赖的全文/grep，SQLite FTS 留到有性能问题再说。
+
+---
+
+## 六、M1 规格：CLI + 结构化条目 + validate
+
+### 目录布局
+
+```
+<memory-root>/
+├── memory.config.json   # scope 声明、注入预算、条目目录开关
+├── index.md             # 自动生成的目录索引（T1 注入用）
+├── facts/               # T2 当前真相：只有 status=active 才参与注入
+├── decisions/           # T3 决策记录（只增不改，含被否决方案）
+├── inbox/               # T4 候选条目 —— 模型默认只能写这里
+├── journal.md           # T5 流水（永不注入）
+└── archive/             # 被取代条目的原文归档
+```
+
+### 条目格式（Markdown + YAML frontmatter，人可读、可 git diff、可 review）
+
+```markdown
+---
+id: mem-2026-09-17-win-update-cache
+type: fact                 # fact | decision
+scope: workspace:D:\idea2023\ai   # global | workspace:<path>
+tags: [windows, disk]
+status: active             # active | superseded | expired
+date: 2026-09-17
+source: session-b3eaa198   # 可回溯原始会话
+supersedes: []             # 本条目取代了谁
+superseded_by: null        # 谁取代了本条目
+verify_when: Windows 大版本更新后重新评估
+---
+## 结论
+清 Windows 更新下载缓存实测收益≈0（目录删空但可用空间没涨），不要再折腾。
+## 理由
+文件已 unlink 但卷统计未变；同时段 servicing 活跃写入吃掉了等量空间。
+```
+
+### CLI 命令面
+
+| 命令 | 作用 |
+| --- | --- |
+| `mem new --type fact\|decision --scope <s> --tags a,b` | 在 **inbox** 创建结构化候选条目（交互/参数填充模板） |
+| `mem list [--status --scope --tag --type]` | 过滤列表 |
+| `mem show <id>` | 单条详情（含来源会话、被谁取代） |
+| `mem promote <id> [--supersedes <id>]` | inbox → facts/decisions；**与已有条目冲突时必须显式 --supersedes** |
+| `mem supersede <old> <new>` | 标记失效 + 归档 + 双向链接 |
+| `mem validate` | 校验（见下） |
+| `mem index` | 重建 index.md（注入用） |
+| `mem inject [--budget <bytes>]` | 渲染"当前应注入的内容"，供插件调用或人工核对 |
+| `mem recall <关键词> [--all]` | 跨 facts/decisions/journal/sessions 检索 |
+| `mem journal add "..."` | 追加流水（今天的 `remember` 就是它） |
+
+### validate 的检查项（M1 必须有）
+
+1. frontmatter 必填字段齐全、枚举值合法（type/status/scope）
+2. id 唯一且格式合法
+3. `supersedes` / `superseded_by` **双向一致**、无环、目标存在
+4. `source` 指向的会话存在（软校验：缺失只告警）
+5. `index.md` 与实际文件一致（可 `--fix`）
+6. **注入预算**：T0+T1 渲染后 ≤ 预算（默认 3 KB）；超了要指出**哪一条最占地方**
+7. 同一 `scope + tags + 语义键` 上存在两条 active 且互相矛盾 → 报冲突
+
+### M1 实测暴露出的三个改进点（2026-09-17 狗粮时发现）
+
+1. **冲突启发式太粗**：现在用「同 scope + 完全相同的 tag 集合」判潜在冲突，结果把所有
+   `design,dsh-memory` 的决策都报成冲突。**M2 要引入语义键**（类似 OpenSpec 的
+   `Requirement: <名字>`），例如条目增加 `key: inject-budget`，只有**同 key** 才判冲突。
+2. **id 不该从结论派生**：中文结论 slugify 之后又长又难看（`2026-09-17-路径含非-ascii-字符时-…`）。
+   `new` 应优先要求显式短 id（如 `mem-win-update-cache`），派生只作兜底。
+3. **`inject` 超预算原本只警告不报错** —— 已修（返回非零退出码），否则 CI/插件无法判断。
+
+### M1 已实现（`dsh-memory/`，33 个测试全绿）
+
+`mem init | new | list | show | promote | supersede | validate | index | inject | journal | recall`，
+零依赖。测试里固化了两条真实踩坑的**回归测试**：非 ASCII 路径下 `fs.rmSync` 静默失败（要用 `unlinkSync`）、
+沙箱禁止命名管道（`spawnSync` 要用文件重定向而非管道）。
+
+
+---
+
+## 七、里程碑
+
+- **M0 ✅**：三层注入可用 + 会话索引 + 解压/检索 CLI + 记忆技能
+- **M1 ✅**：journal 与常驻层分离（解决重复注入成本）；CLI（init/new/list/show/promote/supersede/
+  validate/index/inject/journal/recall）+ 测试
+- **M2 ✅（2026-09-17）**：
+  - 显式短 id（`--id` 优先，派生压到 20 字符并自动去重）
+  - **语义键 `key` + 「一个 key 一个真相」**：`promote` 在同 scope+key 已有 active 时**拒绝**，
+    除非显式 `--supersedes`；`validate` 把同 key 冲突当 **problem**（原先按 tags 判，全是误报）
+  - **`inject --json` 差分载荷**：每条带 12 位 hash —— 这是 M3 差分注入的地基
+  - `validate --fix`：只修机械问题（归档漏归档的 superseded、重建 index），语义问题绝不自动改
+  - **`mem set`**：狗粮时发现的基础能力缺口 —— 条目建好之后总要能改（补 key、改措辞、标 expired），
+    否则只能手改文件，frontmatter 的一致性就守不住
+  - 顺手修：生成 index.md 时误写入 ANSI 颜色转义
+  - 测试 **62 个断言全绿**
+- **M3 ✅（2026-09-17）**：DSH 插件三块全部实现，且**决策逻辑与 DSH 解耦**（DSH 依赖全部注入，
+  用假 agent/decision 就能完整测试）：
+  - **差分注入**：`src/planner.mjs`（纯逻辑）+ `src/hook.mjs`（pre-step 接线）。首次 baseline，
+    之后只推「新增/已更新/已失效」，**完全没变化时零注入**。上游状态从会话历史里自己发过的消息
+    （`source.entries` 带 `{id,hash}`）恢复，因此会话恢复/回放/压缩后依然正确。
+  - **工具**：`memory_search`（跨 facts/decisions/inbox/archive/journal 检索）、
+    `memory_write`（只写 inbox，守住 D2）。
+  - **会话结束蒸馏提醒**：长会话且记忆已最新时提醒一次用 `memory_write` 落结论；提醒消息
+    **不带 entries**，不会把差分基线清零（有专门的回归测试）。
+  - 插件 = `src/plugin.mjs` 薄薄一层（读配置、注入 DSH 依赖、注册 pre-step 与工具）；
+    **不 spawn CLI**（沙箱禁管道，且没必要 —— store 逻辑直接 import）。
+  - 测试 **137 个断言全绿**（CLI 62 + planner 36 + hook 39）。
+  - *遗留：装进 live profile 的实机验证（会改动运行中的环境，需用户同意）。*
+- **M4**：开源到 GitHub（主）+ Gitee（镜像）：README（中英）、文档、示例、测试
+

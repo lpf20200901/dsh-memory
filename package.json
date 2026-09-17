@@ -1,0 +1,58 @@
+{
+  "name": "dsh-memory",
+  "version": "0.1.0",
+  "description": "Layered, auto-injected cross-session memory for AI coding agents: a DSH plugin plus a standalone zero-dependency CLI. Borrows the spec/change/archive discipline from OpenSpec, but pushes instead of pulls.",
+  "type": "module",
+  "main": "./src/plugin.mjs",
+  "exports": {
+    ".": "./src/plugin.mjs",
+    "./cli": "./bin/mem.mjs",
+    "./planner": "./src/planner.mjs",
+    "./hook": "./src/hook.mjs",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "mem": "./bin/mem.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --check src/plugin.mjs && node test/run-tests.mjs && node test/planner-tests.mjs && node test/hook-tests.mjs && node --import ./test/stub-loader.mjs test/plugin-tests.mjs"
+  },
+  "keywords": [
+    "memory",
+    "agent",
+    "dsh",
+    "deepseek-harness",
+    "openspec",
+    "context",
+    "cordis-plugin"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1",
+    "@deepseek-ai/dsh-tools": "^0.1.2-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.2"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    },
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
+  }
+}

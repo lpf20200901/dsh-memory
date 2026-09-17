@@ -1,0 +1,13 @@
+# 运行/测试产物
+node_modules/
+.test-sandbox/
+.preflight-store/
+.tmp-*/
+.dbg/
+.probe*
+*.log
+
+# 安装备份（安装脚本生成的）
+*.bak-memory-*
+*.bak2-memory-*
+*.bak3-memory-*

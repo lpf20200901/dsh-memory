@@ -1,0 +1,121 @@
+/**
+ * 差分注入的**纯逻辑** —— 不依赖 DSH、不碰文件系统，可以独立测试。
+ *
+ * 这是 dsh-memory 相对上游 `dsh-agent-instructions` 的核心增量：
+ * 上游插件没有差分 —— 文件一变就把整篇重新注入（实测一个会话里改 15 次一个 8.5 KB 的文件
+ * 就白烧约 58k tokens）。这里改成：记住上一轮注入的每条 hash，下一轮**只注入变化块**；
+ * 完全没变化时**一个字都不注入**。
+ *
+ * 状态从哪来：不存旁路文件，而是从**会话历史里我们自己发过的那条消息**里读
+ * （消息的 source 带着上一轮的 {id → hash}）。这样会话恢复 / 回放 / 压缩之后状态依然正确。
+ */
+
+export const MEMORY_SOURCE_KIND = 'memory';
+
+/**
+ * 条目集合 → 状态表 { id: hash }。
+ * @param {Array<{id: string, hash: string}>} entries
+ */
+export function stateOf(entries) {
+  const out = {};
+  for (const e of entries) out[e.id] = e.hash;
+  return out;
+}
+
+/** 防止条目正文里的 `</system-reminder>` 提前关掉我们自己的框架（仓库内容不可信）。 */
+export function escapeFraming(text) {
+  return String(text).replaceAll('</system-reminder>', '<\\/system-reminder>');
+}
+
+const label = (e) => {
+  const key = e.key ? ` [${e.key}]` : '';
+  return `- ${escapeFraming(e.line)}${key}  <!-- ${e.id} -->`;
+};
+
+function groupByType(entries) {
+  const facts = entries.filter((e) => e.type === 'fact');
+  const decisions = entries.filter((e) => e.type === 'decision');
+  const other = entries.filter((e) => e.type !== 'fact' && e.type !== 'decision');
+  return { facts, decisions, other };
+}
+
+export function renderBaseline(entries) {
+  if (!entries.length) return '';
+  const { facts, decisions, other } = groupByType(entries);
+  const parts = [
+    '<system-reminder>',
+    '以下是 dsh-memory 记录的项目长期记忆（自动注入）。这些是此前确认过的结论，供参考；',
+    '与当前代码或文件冲突时，以实际为准。需要细节时用 memory_search 工具检索。',
+    '',
+  ];
+  if (facts.length) parts.push('### 事实', ...facts.map(label), '');
+  if (decisions.length) parts.push('### 决策', ...decisions.map(label), '');
+  if (other.length) parts.push('### 其他', ...other.map(label), '');
+  parts.push(`共 ${entries.length} 条。`, '</system-reminder>');
+  return parts.join('\n');
+}
+
+export function renderDelta({ added, changed, removed, unchangedCount = 0 }) {
+  const parts = ['<system-reminder>', 'dsh-memory 有更新（只列变化部分）：', ''];
+  if (added.length) parts.push('新增：', ...added.map(label), '');
+  if (changed.length) parts.push('已更新：', ...changed.map(label), '');
+  if (removed.length) {
+    parts.push('已失效（已被取代或过期，不要再依据）：', ...removed.map((id) => `- ${id}`), '');
+  }
+  if (unchangedCount > 0) parts.push(`其余 ${unchangedCount} 条记忆未变化，保持有效。`);
+  parts.push('</system-reminder>');
+  return parts.join('\n');
+}
+
+/**
+ * 计算这一轮该注入什么。
+ *
+ * @param {Array} current  当前 active 条目（来自 store 的 injectPayload().entries）
+ * @param {object|null} previous  上一轮注入的状态 { id: hash }；null = 本会话还没注入过
+ * @returns {{mode: 'baseline'|'delta'|'none', added: Array, changed: Array, removed: string[], state: object, text: string}}
+ */
+export function planInjection(current, previous) {
+  const state = stateOf(current);
+  if (!previous) {
+    return { mode: 'baseline', added: current, changed: [], removed: [], state, text: renderBaseline(current) };
+  }
+  const added = current.filter((e) => !(e.id in previous));
+  const changed = current.filter((e) => e.id in previous && previous[e.id] !== e.hash);
+  const removed = Object.keys(previous).filter((id) => !(id in state));
+
+  if (!added.length && !changed.length && !removed.length) {
+    // 没有任何变化 —— 一个字都不注入。这就是省下来的 token。
+    return { mode: 'none', added: [], changed: [], removed: [], state, text: '' };
+  }
+  const unchangedCount = current.length - added.length - changed.length;
+  return { mode: 'delta', added, changed, removed, state, text: renderDelta({ added, changed, removed, unchangedCount }) };
+}
+
+/**
+ * 从会话历史里找回上一轮注入的状态。
+ * 只认自己发的消息（source.kind === 'memory'），并取**最后一条**（最近的状态）。
+ *
+ * @param {Array} messages 会话里可见的消息（或本步已领取的消息）
+ * @returns {object|null} { id: hash }，找不到返回 null
+ */
+export function previousStateFrom(messages) {
+  let found = null;
+  for (const m of messages) {
+    const src = m?.source;
+    if (!src || typeof src !== 'object') continue;
+    if (src.kind !== MEMORY_SOURCE_KIND) continue;
+    if (!Array.isArray(src.entries)) continue;
+    found = src.entries;
+  }
+  if (!found) return null;
+  const state = {};
+  for (const e of found) {
+    if (e && typeof e.id === 'string') state[e.id] = String(e.hash ?? '');
+  }
+  return state;
+}
+
+/** 构造要写进消息 source 的状态（供下一轮差分）。 */
+export function sourceEntries(state) {
+  return Object.entries(state).map(([id, hash]) => ({ id, hash }));
+}
