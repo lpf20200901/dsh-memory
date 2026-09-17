@@ -170,6 +170,8 @@ Checked item by item inside a real DSH session:
 | no change → zero injection | the next step injected nothing, only the one-time nudge |
 | delta · added | "新增：<new entry>", explicitly noting "the other N entries are unchanged" |
 | delta · updated | after editing one entry, only "已更新：<that entry>" was pushed |
+| due-for-review reminder | adding an entry whose `verify_when` was 16 days overdue produced a one-time `form='due'` reminder on the next no-change step, and the step after it injected nothing (the reminder did not reset the diff baseline) |
+| sidebar **记忆** tab | the tab opened on a live store and showed the real root, "常驻 12 条", "注入 1792 / 3072 字节", the facts/decisions split and the (empty) inbox |
 | `memory_search` / `memory_write` | both called successfully in the real runtime |
 | writes land only in the inbox | the written candidate did **not** enter the injection payload; it appeared as a delta only after promotion |
 
