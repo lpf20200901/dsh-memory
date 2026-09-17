@@ -32,6 +32,36 @@ function check(n, c, d = '') {
 }
 const section = (t) => console.log(`\n${t}`);
 
+/**
+ * 递归校验"无损 JSON" —— DSH 的工具层要求返回值里不能有 `undefined`（也不能有函数 / Date /
+ * 类实例等）：只要有一个属性是 `undefined`，**整个工具调用就失败**
+ * （`value is not lossless JSON`）。桩模块不校验这个，所以这里自己校验。
+ * 真机上踩到过：命中流水行（没有 type/status）或没有 key 的条目时，输出里漏出了 undefined。
+ */
+function losslessError(value, path = '$') {
+  if (value === undefined) return `${path} 是 undefined（DSH 判为非法）`;
+  if (value === null) return null;
+  const t = typeof value;
+  if (t === 'string' || t === 'number' || t === 'boolean') return null;
+  if (Array.isArray(value)) {
+    for (const [i, v] of value.entries()) {
+      const e = losslessError(v, `${path}[${i}]`);
+      if (e) return e;
+    }
+    return null;
+  }
+  if (t === 'object') {
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) return `${path} 不是普通对象`;
+    for (const [k, v] of Object.entries(value)) {
+      const e = losslessError(v, `${path}.${k}`);
+      if (e) return e;
+    }
+    return null;
+  }
+  return `${path} 的类型 ${t} 不是 JSON 值`;
+}
+
 function rmrf(p) {
   if (!fs.existsSync(p)) return;
   const st = fs.lstatSync(p);
@@ -222,6 +252,24 @@ const toolAgent = fakeAgent(cwdOfProject, 'session-tool');
 
   const rendered = searchTool.output.render({}, none);
   check('无可渲染输出时不炸', Array.isArray(rendered) && typeof rendered[0].text === 'string', JSON.stringify(rendered));
+
+  // 回归（真机踩到）：命中**没有 key 的条目**或**流水行**时，输出里曾漏出 `undefined`，
+  // 而 DSH 要求无损 JSON → 整个 memory_search 调用直接失败（"value is not lossless JSON"）。
+  const keyless = await searchTool.execute({ query: 'rmSync' }, { agent: toolAgent });
+  check('命中无 key 条目时输出是无损 JSON', losslessError(keyless) === null, losslessError(keyless) ?? '');
+  check('无 key 条目确实命中了（不是空结果蒙过去）', keyless.matches.length > 0 && keyless.matches.every((m) => !('key' in m)), JSON.stringify(keyless.matches.map((m) => Object.keys(m))));
+
+  // 流水行没有 type/status/key —— 这些字段必须整条省掉，而不是留成 undefined
+  fs.appendFileSync(path.join(L.root, 'journal.md'), '- 2026-01-01 流水：命名管道那条坑\n', 'utf8');
+  const journalHit = await searchTool.execute({ query: '命名管道那条坑', where: 'journal' }, { agent: toolAgent });
+  check('流水行能被检索到', journalHit.total > 0, JSON.stringify(journalHit).slice(0, 160));
+  check('命中流水行时输出是无损 JSON', losslessError(journalHit) === null, losslessError(journalHit) ?? '');
+  check(
+    '流水行命中不含 type/status/key 字段（省掉而不是留 undefined）',
+    journalHit.matches.every((m) => !('type' in m) && !('status' in m) && !('key' in m)),
+    JSON.stringify(journalHit.matches.map((m) => Object.keys(m))),
+  );
+  check('memory_write 的输出也是无损 JSON', losslessError(await writeTool.execute({ type: 'fact', conclusion: '无损 JSON 探针' }, { agent: toolAgent })) === null);
 }
 
 /* ------------------------------------------------- 到期复核：真接线跑一遍 */

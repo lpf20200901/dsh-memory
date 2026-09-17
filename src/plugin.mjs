@@ -153,17 +153,24 @@ export function apply(ctx, config = {}) {
         const docs = collectDocs(store.L, { where: want });
         const hits = rankDocs(docs, args.query, { limit });
 
-        const matches = hits.map((h) => ({
-          id: h.id,
-          where: h.where,
-          type: h.type,
-          status: h.status,
-          key: h.key ?? undefined,
-          line: truncated(h.line, 240),
-          snippet: truncated(h.snippet, 240),
-          score: Number(h.score.toFixed(2)),
-          matched: h.matched,
-        }));
+        // ⚠️ 工具返回值必须是**无损 JSON**：DSH 会把值为 `undefined` 的属性判定为非法
+        // （`dsh-tools` 的 "value is not lossless JSON"），**整个工具调用直接失败**。
+        // 命中流水行时没有 type/status/key，命中没写 key 的条目时没有 key —— 必须把这些
+        // 字段**整条省掉**，而不是留成 undefined（也不能给 null：schema 声明的是 string）。
+        const defined = (obj) => Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined));
+        const matches = hits.map((h) =>
+          defined({
+            id: h.id,
+            where: h.where,
+            type: h.type,
+            status: h.status,
+            key: h.key ?? undefined,
+            line: truncated(h.line, 240),
+            snippet: truncated(h.snippet, 240),
+            score: Number(h.score.toFixed(2)),
+            matched: h.matched,
+          }),
+        );
 
         return Promise.resolve({ total: matches.length, matches });
       },
