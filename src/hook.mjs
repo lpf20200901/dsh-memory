@@ -34,7 +34,7 @@ export function sameMemoryPayload(a, b) {
  */
 export const NUDGE_TEXT = [
   '<system-reminder>',
-  'dsh-memory 提醒：如果这次会话产生了值得长期留存的结论 —— 用户的偏好/禁忌、定下来的约定、',
+  'dsh-memory-delta 提醒：如果这次会话产生了值得长期留存的结论 —— 用户的偏好/禁忌、定下来的约定、',
   '踩到的坑、项目状态变化 —— 用 memory_write 工具写进收件箱（一条一个结论，写结论不写过程）。',
   '它会先进 inbox，确认后才成为常驻事实；不需要重新交代上下文。',
   '没有值得留存的就忽略本条。',

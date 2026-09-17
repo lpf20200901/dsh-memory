@@ -1,7 +1,7 @@
 /**
  * 差分注入的**纯逻辑** —— 不依赖 DSH、不碰文件系统，可以独立测试。
  *
- * 这是 dsh-memory 相对上游 `dsh-agent-instructions` 的核心增量：
+ * 这是 dsh-memory-delta 相对上游 `dsh-agent-instructions` 的核心增量：
  * 上游插件没有差分 —— 文件一变就把整篇重新注入（实测一个会话里改 15 次一个 8.5 KB 的文件
  * 就白烧约 58k tokens）。这里改成：记住上一轮注入的每条 hash，下一轮**只注入变化块**；
  * 完全没变化时**一个字都不注入**。
@@ -60,7 +60,7 @@ export function renderBaseline(entries) {
   const { facts, decisions, other } = groupByType(entries);
   const parts = [
     '<system-reminder>',
-    '以下是 dsh-memory 记录的项目长期记忆（自动注入）。这些是此前确认过的结论，供参考；',
+    '以下是 dsh-memory-delta 记录的项目长期记忆（自动注入）。这些是此前确认过的结论，供参考；',
     '与当前代码或文件冲突时，以实际为准。需要细节时用 memory_search 工具检索。',
     '',
   ];
@@ -72,7 +72,7 @@ export function renderBaseline(entries) {
 }
 
 export function renderDelta({ added, changed, removed, unchangedCount = 0 }) {
-  const parts = ['<system-reminder>', 'dsh-memory 有更新（只列变化部分）：', ''];
+  const parts = ['<system-reminder>', 'dsh-memory-delta 有更新（只列变化部分）：', ''];
   if (added.length) parts.push('新增：', ...added.map(label), '');
   if (changed.length) parts.push('已更新：', ...changed.map(label), '');
   if (removed.length) {

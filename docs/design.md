@@ -1,7 +1,7 @@
 # 记忆系统的设计与演进（讨论稿）
 
 > 状态：**讨论中**（2026-09-17 起）。本文件是"最上层记忆"的落点：记录设计决策、理由、被否决的方案与开放问题。
-> 目标产品：`dsh-memory` —— 一个可独立使用的 CLI + 一个 DSH 插件，开源到 GitHub（主）/ Gitee（镜像）。
+> 目标产品：`dsh-memory-delta` —— 一个可独立使用的 CLI + 一个 DSH 插件，开源到 GitHub（主）/ Gitee（镜像）。
 
 ---
 
@@ -69,7 +69,7 @@
 
 ---
 
-## 四、插件形态（`dsh-memory`）
+## 四、插件形态（`dsh-memory-delta`）
 
 以现有插件 `@deepseek-ai/dsh-agent-instructions` 为参考实现（它的 seam 已确认可用：
 `agent/pre-step` 监听 + inbox 组合 + 基于 fs touch 的刷新 + digest 去重 + 字节预算截断 + `</system-reminder>` 转义）。
@@ -88,7 +88,7 @@
 仓库结构（草案）：
 
 ```
-dsh-memory/
+dsh-memory-delta/
 ├── package.json / cordis.yml    插件清单（参考 dsh-agent-instructions）
 ├── src/{index,store,inject,index-builder,validate,tools}.ts
 ├── bin/memory.mjs               CLI（可与插件分离发布）
@@ -182,13 +182,13 @@ verify_when: Windows 大版本更新后重新评估
 ### M1 实测暴露出的三个改进点（2026-09-17 狗粮时发现）
 
 1. **冲突启发式太粗**：现在用「同 scope + 完全相同的 tag 集合」判潜在冲突，结果把所有
-   `design,dsh-memory` 的决策都报成冲突。**M2 要引入语义键**（类似 OpenSpec 的
+   `design,dsh-memory-delta` 的决策都报成冲突。**M2 要引入语义键**（类似 OpenSpec 的
    `Requirement: <名字>`），例如条目增加 `key: inject-budget`，只有**同 key** 才判冲突。
 2. **id 不该从结论派生**：中文结论 slugify 之后又长又难看（`2026-09-17-路径含非-ascii-字符时-…`）。
    `new` 应优先要求显式短 id（如 `mem-win-update-cache`），派生只作兜底。
 3. **`inject` 超预算原本只警告不报错** —— 已修（返回非零退出码），否则 CI/插件无法判断。
 
-### M1 已实现（`dsh-memory/`，33 个测试全绿）
+### M1 已实现（`dsh-memory-delta/`，33 个测试全绿）
 
 `mem init | new | list | show | promote | supersede | validate | index | inject | journal | recall`，
 零依赖。测试里固化了两条真实踩坑的**回归测试**：非 ASCII 路径下 `fs.rmSync` 静默失败（要用 `unlinkSync`）、

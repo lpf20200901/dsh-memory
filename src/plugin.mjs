@@ -1,5 +1,5 @@
 /**
- * dsh-memory 的 **DSH 插件**（Cordis）。
+ * dsh-memory-delta 的 **DSH 插件**（Cordis）。
  *
  * 这一层刻意做得很薄：所有决策逻辑都在 `hook.mjs`（已单测，用假 agent/decision 完整覆盖），
  * 这里只负责三件事 —— 读配置、把 DSH 的依赖注进去、注册 pre-step 与两个工具。
@@ -17,6 +17,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { collectDocs, createEntry, ensureLayout, injectPayload, loadConfig } from '../bin/mem.mjs';
 import { createMemoryHook } from './hook.mjs';
+import { memoryStateOf, registerMemoryRoute } from './panel.mjs';
 import { MEMORY_SOURCE_KIND } from './planner.mjs';
 import { rankDocs } from './search.mjs';
 
@@ -32,6 +33,8 @@ export const Config = z.object({
   enabled: z.boolean().default(true),
   /** `verify_when` 提前几天提醒复核（0 = 只在已到期时提醒）。 */
   dueWithin: z.number().step(1).min(0).default(0),
+  /** 关掉侧边栏「记忆」页签的数据路由（无 webServer 时本来就不注册）。 */
+  panel: z.boolean().default(true),
 });
 
 /** 把 (config, cwd) 解析成一次可用的记忆库句柄。 */
@@ -92,7 +95,7 @@ export function apply(ctx, config = {}) {
     defineTool({
       name: 'memory_search',
       description:
-        'Search the project long-term memory (dsh-memory): confirmed facts, decisions, the journal, ' +
+        'Search the project long-term memory (dsh-memory-delta): confirmed facts, decisions, the journal, ' +
         'the session index, and the inbox of pending candidates. Use it when the user refers to past ' +
         'decisions, conventions, or "we already figured this out". Results are ranked by relevance and ' +
         'each carries a snippet; Chinese queries are matched by bigram, so no need to add spaces.',
@@ -230,6 +233,35 @@ export function apply(ctx, config = {}) {
       presentCall: (args) => ({ card: 'generic', title: `Remember: ${truncated(args.conclusion, 60)}`, kind: 'other', rawInput: args }),
     }),
   );
+
+  /* ------------------------------------------- 侧边栏「记忆」页签的数据路由 */
+  // webServer 是**可选**依赖：headless / CLI 组合里没有它。
+  // 用 `ctx.get('webServer')` 而不是把它写进 `inject` —— Cordis 的 inject 是**硬依赖**，
+  // 声明了就会让整个插件在 webServer 出现前一直 PENDING（headless 下等于插件根本不加载）。
+  // 依据：`cordis-plugin-development` 技能 "Access Services" 一节（`ctx.get(name)` 读可选能力、
+  // 只有硬依赖才写 `inject`），以及 `ctx.get` 的实现 cordis/src/reflect.ts:233。
+  //
+  // 页面半边的注册在 client/client.js，它只认 `registerTab`；路由没有注册成功时
+  // （webServer 缺失或 panel:false），页签会显示明确的错误行，而不是一片空白。
+  if (config.panel !== false) {
+    const webServer = ctx.get?.('webServer');
+    if (webServer) {
+      // root 优先：配了插件 root 就以它为准（用户在别处维护的记忆库）；
+      // 否则 <workspace>/memory。客户端把 scope.cwd 作为 workspace 传进来。
+      registerMemoryRoute(
+        webServer,
+        (input) =>
+          memoryStateOf({
+            configRoot: config.root || undefined,
+            workspace: input?.workspace,
+            dueWithin: config.dueWithin ?? 0,
+          }),
+        ctx.effect?.bind(ctx),
+      );
+    } else {
+      ctx.logger?.debug?.('memory: 没有 webServer，跳过侧边栏「记忆」页签的数据路由');
+    }
+  }
 
   // 返回 hook：不是为了给 DSH 用（loader 不看返回值），而是留一个**不污染 ctx 的测试缝** ——
   // 只算不做的 `planFor` 是排查"这轮为什么注入/为什么不注入"最直接的入口，

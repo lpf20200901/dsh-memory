@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * mem — dsh-memory CLI（M1）
+ * mem — dsh-memory-delta CLI（M1）
  *
- * 设计要点（见 memory/design/dsh-memory-plugin.md）：
+ * 设计要点（见 memory/design/dsh-memory-delta-plugin.md）：
  *   · 分层：inbox（候选）→ facts/decisions（当前真相）→ archive（被取代）
  *   · 模型默认只能写 inbox；提升到事实层需要显式 promote —— 防止错误结论被反复注入
  *   · 条目是「Markdown + 极简 YAML frontmatter」：人可读、可 git diff、可 review
@@ -1030,7 +1030,7 @@ export {
 };
 
 function usage() {
-  console.log(`mem ${VERSION} — dsh-memory CLI
+  console.log(`mem ${VERSION} — dsh-memory-delta CLI
 
 用法： mem <命令> [选项]
 

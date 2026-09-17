@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * dsh-memory 测试 —— 零依赖，直接 `node test/run-tests.mjs`
+ * dsh-memory-delta 测试 —— 零依赖，直接 `node test/run-tests.mjs`
  *
  * 两处沙箱坑都固化在这里了（详见每处的注释）：
  *   1. 「非 ASCII 路径」那组是**回归测试**：路径含非 ASCII 字符时 `fs.rmSync` 会静默失败
@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const MEM = path.join(HERE, '..', 'bin', 'mem.mjs');
-const SANDBOX = path.join(HERE, '..', '.test-sandbox');
+const SANDBOX = process.env.MEM_TEST_SANDBOX || path.join(HERE, '..', `.test-sandbox-${process.pid}`);
 
 let pass = 0;
 let fail = 0;
@@ -125,7 +125,7 @@ section('基础流程（ASCII 路径）');
   // 注入正文里只有结论（id 不占预算，它随 source.entries 走结构化通道）
   check('inject 只含 active（被取代的不出现）', r.out.includes('结论二') && !r.out.includes('结论一'), flat(r.out));
   check('inject 正文不写 id（省预算）', !r.out.includes('<!--') && !r.out.includes(idB), flat(r.out));
-  check('inject 与 validate 用同一套渲染（字节数才对得上）', r.out.includes('dsh-memory 记录的项目长期记忆'), flat(r.out).slice(0, 80));
+  check('inject 与 validate 用同一套渲染（字节数才对得上）', r.out.includes('dsh-memory-delta 记录的项目长期记忆'), flat(r.out).slice(0, 80));
   const payable = JSON.parse(run(['inject', '--root', root, '--json']).out);
   check('--json 的 text 与 CLI 输出同源', payable.text.includes('结论二') && Buffer.byteLength(payable.text, 'utf8') === payable.bytes, `${payable.bytes}`);
 

@@ -1,5 +1,5 @@
 {
-  "name": "dsh-memory",
+  "name": "dsh-memory-delta",
   "version": "0.1.0",
   "description": "Layered, auto-injected cross-session memory for AI coding agents: a DSH plugin plus a standalone zero-dependency CLI. Borrows the spec/change/archive discipline from OpenSpec, but pushes instead of pulls.",
   "type": "module",
@@ -7,8 +7,11 @@
   "exports": {
     ".": "./src/plugin.mjs",
     "./cli": "./bin/mem.mjs",
+    "./panel": "./src/panel.mjs",
     "./planner": "./src/planner.mjs",
     "./hook": "./src/hook.mjs",
+    "./client": "./client/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "bin": {
@@ -17,13 +20,26 @@
   "files": [
     "bin",
     "src",
+    "client",
+    "cordis.patch.yml",
     "README.md"
   ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "dsh-better-sidebar"
+      ]
+    }
+  },
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "test": "node --check src/plugin.mjs && node test/run-tests.mjs && node test/planner-tests.mjs && node test/search-tests.mjs && node test/due-tests.mjs && node test/hook-tests.mjs && node --import ./test/stub-loader.mjs test/plugin-tests.mjs"
+    "test": "node --check src/plugin.mjs && node --check src/panel.mjs && node --check client/client.js && node test/run-tests.mjs && node test/planner-tests.mjs && node test/search-tests.mjs && node test/due-tests.mjs && node test/hook-tests.mjs && node --import ./test/stub-loader.mjs test/plugin-tests.mjs && node test/client-tests.mjs"
   },
   "keywords": [
     "memory",

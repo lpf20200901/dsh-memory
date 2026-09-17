@@ -4,7 +4,7 @@
  *
  * 它验证的是桩测试覆盖不到的那部分：真实的 `defineTool` / `schemastery` 是否接受我们的定义。
  * 跑法（用 DSH 自带的 node）：
- *   <DSH_HOME>\.desktop-bin\node.cmd <profile>\node_modules\dsh-memory\test\preflight-import.mjs
+ *   <DSH_HOME>\.desktop-bin\node.cmd <profile>\node_modules\dsh-memory-delta\test\preflight-import.mjs
  *
  * ⚠️ 在 DSH 沙箱里跑时，默认的 store（插件目录下的 .preflight-store）在工作区之外，
  * 建目录会被拒（EPERM）。这时把 store 指到工作区/临时目录里：

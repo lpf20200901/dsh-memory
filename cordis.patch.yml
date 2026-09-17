@@ -1,0 +1,17 @@
+# dsh-memory-delta bundle patch：把本插件插进一个 dsh profile 的 loader 栈。
+#
+# ⚠️ 必须写在 `- insert:` 下面 —— 裸条目会被当成"改已有 id"而被**静默忽略**
+# （本仓库实测踩过：加了裸条目，重启后毫无反应，日志里也没有任何提示）。
+# 这是给"进插件市场"用的清单：市场装完包后由 bundle patch 负责接线。
+#
+# 行 id 与 name 都用**包名** dsh-memory-delta（npm 上的 dsh-memory 已被他人占用，
+# 所以本插件改名成了 dsh-memory-delta；浏览器模块身份也用这个名字，别写回旧名）。
+# name 解析到 profile 自己的 node_modules 下的包名。config 里的 root 留空 = 用
+# <会话工作区>/memory（记忆库 root 可配置，默认就在工作区里）。
+- insert:
+    - id: dsh-memory-delta
+      name: dsh-memory-delta
+      config:
+        root: ''
+        maxBytes: 3072
+        enabled: true

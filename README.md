@@ -1,4 +1,4 @@
-# dsh-memory
+# dsh-memory-delta
 
 English | [中文](README.zh.md)
 
@@ -7,8 +7,8 @@ A [DSH](https://github.com/deepseek-ai/deepseek-harness) (DeepSeek Harness) plug
 zero-dependency standalone CLI. It borrows the *spec / change / archive* discipline from
 [OpenSpec](https://github.com/Fission-AI/OpenSpec) — but **pushes** instead of pulls.
 
-> **Canonical repository: [GitHub](https://github.com/lpf20200901/dsh-memory)** ·
-> [Gitee](https://gitee.com/xingluzhe/dsh-memory) is a read-only mirror —
+> **Canonical repository: [GitHub](https://github.com/lpf20200901/dsh-memory-delta)** ·
+> [Gitee](https://gitee.com/xingluzhe/dsh-memory-delta) is a read-only mirror —
 > please file issues and pull requests on GitHub.
 
 > Status: **M1–M4 done**; M3/M4 (differential injection, both tools, the distillation nudge) were
@@ -26,7 +26,7 @@ AI coding assistants have two recurring problems:
 
 Existing spec-driven tools (OpenSpec and friends) solve "the code drifts away from the plan". But they
 are **pull-based**: the agent has to be told to go read the specs, so a fresh session does not
-spontaneously remember anything. dsh-memory is **push-based**: at session start the agent is handed what
+spontaneously remember anything. dsh-memory-delta is **push-based**: at session start the agent is handed what
 it should know — but only the *distilled* part, and only *what changed*. Details stay retrievable on demand.
 
 ## Design
@@ -87,7 +87,7 @@ Seven rules:
 1. Copy this package into the profile's `node_modules`:
 
    ```
-   <DSH_HOME>\profiles\web\node_modules\dsh-memory\
+   <DSH_HOME>\profiles\web\node_modules\dsh-memory-delta\
        package.json
        bin\mem.mjs
        src\plugin.mjs  src\hook.mjs  src\planner.mjs
@@ -97,8 +97,8 @@ Seven rules:
 
    ```yaml
    - insert:
-       - id: dsh-memory
-         name: dsh-memory
+       - id: dsh-memory-delta
+         name: dsh-memory-delta
          config:
            root: ''          # empty = <session cwd>/memory
            maxBytes: 3072    # byte budget for the baseline injection
@@ -107,7 +107,7 @@ Seven rules:
 
 3. Save. The patch layer is watched (`watchUserPatches`) — it **hot-reloads, no restart needed**.
 
-**Uninstall**: remove that `- insert:` block and delete `node_modules\dsh-memory`.
+**Uninstall**: remove that `- insert:` block and delete `node_modules\dsh-memory-delta`.
 
 > The market/registry publishing flow was not investigated yet; the above is the local install path.
 
@@ -120,10 +120,13 @@ Seven rules:
 | `memory_write` | Record a candidate into the inbox — **the model cannot touch the standing layer** |
 | Distillation nudge | Once a session has run a few steps and memory is already current, it reminds the model to record conclusions with `memory_write`; one nudge per session, and the nudge message carries **no state**, so it cannot corrupt the diff baseline |
 | Due-for-review reminder | `verify_when` is no longer a dead field: when an entry reaches its review date, the session is told once — "this conclusion may be stale, re-check it" — with the exact command to supersede or expire it. Prose values (`等换机器时`) never trigger it, so the reminder can always be resolved; it fires only on a step that injects nothing else, and it carries **no state** either |
+| Sidebar memory tab | With [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) installed, a **记忆** tab lists the standing entries, the due-for-review items and the inbox candidates, plus the current injection size. The client half is a **hand-written, zero-build browser bundle** (a `window.__ModuleLoader__.load({id, factory})` wrapper, no bundler); its data comes from a read-only `POST /dsh-memory-delta/state` route owned by this plugin — loopback-only, JSON in / JSON out, and it reads nothing but the memory store |
 
 The plugin never spawns the CLI: the DSH sandbox forbids named pipes (capturing a child's output fails
 with EPERM), and there is no need — it imports the same store module directly (`bin/mem.mjs` only runs
-the CLI when executed as the entry point).
+the CLI when executed as the entry point). It also never *requires* the sidebar: `webServer` is read
+through `ctx.get('webServer')` (an optional capability), so a headless or CLI-only composition loads the
+plugin unchanged and simply skips the panel route.
 
 ## CLI usage
 

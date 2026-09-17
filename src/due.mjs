@@ -173,7 +173,7 @@ export function renderDue(list, { max = 5 } = {}) {
   const shown = items.slice(0, cap);
   const parts = [
     '<system-reminder>',
-    'dsh-memory 提醒：下面这些记忆到了当初约定的复核期（`mem due` 看全量）。',
+    'dsh-memory-delta 提醒：下面这些记忆到了当初约定的复核期（`mem due` 看全量）。',
     '它们的结论可能已经过时 —— 请逐条判断，必要时用 memory_search 查细节：',
   ];
   for (const d of shown) parts.push(`- ${clip(d.line)} —— verify_when: ${d.verifyWhen}（${duePhrase(d.overdueDays)}）`);

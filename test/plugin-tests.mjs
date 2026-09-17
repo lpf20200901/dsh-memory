@@ -12,10 +12,13 @@ import { fileURLToPath } from 'node:url';
 
 import { Config, apply, inject as injectServices, name } from '../src/plugin.mjs';
 import { createEntry, ensureLayout, injectPayload, readAll } from '../bin/mem.mjs';
+import { MEMORY_ROUTE_PATH, createMemoryRoute, memoryStateOf, registerMemoryRoute, resolvePanelRoot } from '../src/panel.mjs';
 import { MEMORY_SOURCE_KIND } from '../src/planner.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const SANDBOX = path.join(HERE, '..', '.test-sandbox');
+// 沙箱目录**按进程分**：两套测试同时跑（两个 agent 并行、或边跑测试边手动验证）时
+// 共用同一个 `.test-sandbox` 会互相 rmrf，表现为"随机失败且每次失败项都不同" —— 真实踩过。
+const SANDBOX = process.env.MEM_TEST_SANDBOX || path.join(HERE, '..', `.test-sandbox-${process.pid}`);
 
 let pass = 0;
 let fail = 0;
@@ -92,6 +95,79 @@ function fakeCtx() {
     logger: { warn: (...a) => warnings.push(a[0]) },
     get: () => undefined,
   };
+}
+
+/**
+ * 带 webServer 的假 ctx —— 用来验证「记忆」页签那条只读路由的**真实接线**。
+ * 同时记录 ctx.effect 的用法（路由必须走 effect 托管，否则卸载后路由还在）。
+ */
+function fakeCtxWithWebServer() {
+  const ctx = fakeCtx();
+  const routes = [];
+  const effects = [];
+  ctx.routes = routes;
+  ctx.effects = effects;
+  ctx.effect = (fn, label) => {
+    effects.push(label);
+    return fn();
+  };
+  ctx.get = (name) => {
+    if (name !== 'webServer') return undefined;
+    return {
+      register(route) {
+        routes.push(route);
+        return () => {};
+      },
+    };
+  };
+  return ctx;
+}
+
+/* ------------------------------------------- 假的 req / res（node:http 形状） */
+
+function fakeRes() {
+  const state = { status: null, headers: null, body: '' };
+  return {
+    state,
+    writeHead(status, headers) {
+      state.status = status;
+      state.headers = headers ?? null;
+    },
+    end(chunk) {
+      if (chunk !== undefined) state.body += String(chunk);
+    },
+    json() {
+      return JSON.parse(state.body || '{}');
+    },
+  };
+}
+
+function fakeReq({ method = 'POST', body = '', headers = { host: '127.0.0.1:23278' }, url = MEMORY_ROUTE_PATH } = {}) {
+  const listeners = new Map();
+  return {
+    method,
+    url,
+    headers,
+    on(event, fn) {
+      listeners.set(event, fn);
+      return this;
+    },
+    // 手动投递 body：所有 on() 都注册完之后再调，避免监听器还没挂上就已结束
+    send() {
+      if (body !== '') listeners.get('data')?.(Buffer.from(body, 'utf8'));
+      listeners.get('end')?.();
+    },
+  };
+}
+
+/** 跑一次 handler，返回 {status, json} —— res 收集写入的 body。 */
+async function callRoute(route, options = {}) {
+  const req = fakeReq(options);
+  const res = fakeRes();
+  const pending = route.handler(req, res);
+  req.send();
+  await pending;
+  return { status: res.state.status, json: res.json(), headers: res.state.headers };
 }
 
 function fakeAgent(cwd, id = 'session-test') {
@@ -348,6 +424,162 @@ section('到期复核：通过插件真实接线发出 form=due 的提醒');
   check('dueWithin=30：还没到期但快了 → 提醒（Config 真的透传到了 hook）', !!dueSoon, JSON.stringify(outSoonOn.messages.map((m) => m.source?.form)));
   check('到期提醒里带上 verify_when 原值', !!dueSoon && dueSoon.content[0].text.includes(inTenDays), dueSoon?.content[0].text.slice(0, 120));
   check('dueWithin 生效时也不带 entries（不污染差分基线）', !!dueSoon && dueSoon.source.entries === undefined, JSON.stringify(dueSoon?.source));
+}
+
+/* --------------------------------------- 侧边栏「记忆」页签的数据路由 */
+
+section('侧边栏「记忆」页签：只读 JSON 路由');
+{
+  // 根目录解析：插件 root 优先；否则 <workspace>/memory
+  const r1 = resolvePanelRoot({ configRoot: ROOT, workspace: path.join(SANDBOX, 'other') });
+  check('配置了插件 root 就用它（不受 workspace 影响）', r1.root === ROOT, String(r1.root));
+  const r2 = resolvePanelRoot({ workspace: cwdOfProject });
+  check('没配 root 时用 <workspace>/memory', r2.root === path.join(cwdOfProject, 'memory'), String(r2.root));
+  const r3 = resolvePanelRoot({});
+  check('workspace 缺失时返回根目录 null（调用方给空状态，不抛错）', r3.root === null, String(r3.root));
+
+  // 真接线：apply 时 ctx.get('webServer') 给出服务 → 注册一条 exact 路由
+  const panelCtx = fakeCtxWithWebServer();
+  apply(panelCtx, { root: ROOT, maxBytes: 3072, dueWithin: 0 });
+  check('注册了恰好 1 条路由（工具仍是 2 个）', panelCtx.routes.length === 1 && panelCtx.registered.length === 2, String(panelCtx.routes.length));
+  const route = panelCtx.routes[0];
+  check('路由 kind 是 exact', route.kind === 'exact', String(route.kind));
+  check('路由路径是 /dsh-memory-delta/state', route.path === MEMORY_ROUTE_PATH && route.path === '/dsh-memory-delta/state', String(route.path));
+
+  // 路径在**两处**各写了一遍（宿主 `src/panel.mjs`、客户端 `client/client.js`）——
+  // 写歪一处就是"页签一直是空的"这种最难查的故障。这里直接把两边钉成同一个字符串。
+  const clientSrc = fs.readFileSync(path.join(HERE, '..', 'client', 'client.js'), 'utf8');
+  const clientUrl = /const STATE_URL = '([^']+)'/.exec(clientSrc)?.[1];
+  check('客户端 fetch 的 URL 与宿主路由路径完全一致', clientUrl === MEMORY_ROUTE_PATH, `${clientUrl} vs ${MEMORY_ROUTE_PATH}`);
+  const clientId = /id:\s*'([^']+)',\s*\n\s*factory:/.exec(clientSrc)?.[1];
+  check('客户端 bundle 的 id 是包名 dsh-memory-delta', clientId === 'dsh-memory-delta', String(clientId));
+  check('路由通过 ctx.effect 托管（可随插件卸载）', panelCtx.effects.length === 1, JSON.stringify(panelCtx.effects));
+  check('effect 带可读的标签（含新包名）', panelCtx.effects[0] === 'dsh-memory-delta: /dsh-memory-delta/state route', String(panelCtx.effects[0]));
+
+  // 正常：POST + 回环来源
+  // 临时库：专门用来钉"到期条目"的展示形状（共享库里的 stale-fact 在别处被改成
+  // 了人话写法 verify_when，那是**故意不提醒**的场景，不适合拿来断言 due）。
+  const panelRoot = path.join(SANDBOX, 'panel', 'memory');
+  ensureLayout(panelRoot);
+  const panelL = ensureLayout(panelRoot, { create: false });
+  const panelStale = createEntry(panelL, { type: 'fact', id: 'panel-stale', conclusion: '面板要看到这条已过期的复核项', source: 's-panel' });
+  fs.writeFileSync(
+    path.join(panelL.facts, 'panel-stale.md'),
+    fs.readFileSync(panelStale.file, 'utf8').replace('verify_when: null', 'verify_when: 2000-01-01'),
+    'utf8',
+  );
+  fs.unlinkSync(panelStale.file);
+  const dueJson = memoryStateOf({ configRoot: panelRoot, workspace: cwdOfProject });
+
+  // 注意：这条路由的 root **由插件的 config.root 决定**（配了就以它为准），
+  // 所以请求里的 workspace 只影响 scope 文案，不改变读的是哪个库 —— 下面按这个契约断言。
+  const okRes = await callRoute(route, { body: JSON.stringify({ workspace: cwdOfProject }) });
+  const directState = memoryStateOf({ configRoot: ROOT, workspace: cwdOfProject });
+  check('POST 回环来源 → 200', okRes.status === 200, String(okRes.status));
+  check('响应的 content-type 是 JSON', /application\/json/.test(String(okRes.headers?.['content-type'])), String(okRes.headers?.['content-type']));
+  check('响应 ok:true', okRes.json.ok === true, JSON.stringify({ ok: okRes.json.ok, error: okRes.json.error }));
+  check('响应带 root', okRes.json.root === ROOT, String(okRes.json.root));
+  check('配了 config.root 时它就是权威（workspace 不改变读哪个库）', okRes.json.root === directState.root, `${okRes.json.root} vs ${directState.root}`);
+  check('响应带 today（YYYY-MM-DD）', /^\d{4}-\d{2}-\d{2}$/.test(String(okRes.json.today)), String(okRes.json.today));
+  check('响应带 budget 与 bytes', okRes.json.budget === 3072 && typeof okRes.json.bytes === 'number', JSON.stringify({ b: okRes.json.budget, y: okRes.json.bytes }));
+  check('空状态时明确给出 error 文案（客户端据此显示错误行）', okRes.json.error === undefined || typeof okRes.json.error === 'string', JSON.stringify(okRes.json.error));
+  check('entries 与 injectPayload 同源', okRes.json.entries.length === injectPayload(L, 3072).entries.length, `${okRes.json.entries.length} vs ${injectPayload(L, 3072).entries.length}`);
+  check('entries 每条都带 id/type/line', okRes.json.entries.length > 0 && okRes.json.entries.every((e) => !!e.id && !!e.type && !!e.line), JSON.stringify(okRes.json.entries).slice(0, 200));
+  check(
+    'due 里带 overdueDays 与 verify_when（用一个临时库钉住，不看共享库的时点状态）',
+    dueJson !== null && dueJson.due.length === 1 && dueJson.due[0].id === 'panel-stale' && dueJson.due[0].overdueDays > 0 && dueJson.due[0].verifyWhen === '2000-01-01',
+    JSON.stringify(dueJson?.due ?? null),
+  );
+  check('due 项的 due 日期与 counts.due 一致', dueJson.entries.find((e) => e.id === 'panel-stale')?.due === dueJson.due[0].due && dueJson.counts.due === 1, JSON.stringify(dueJson.due[0]));
+  check('counts 六个字段齐全', ['active', 'facts', 'decisions', 'inbox', 'archive', 'due'].every((k) => typeof okRes.json.counts[k] === 'number'), JSON.stringify(okRes.json.counts));
+  check('counts.due 与 due 长度一致', okRes.json.counts.due === okRes.json.due.length, `${okRes.json.counts.due} vs ${okRes.json.due.length}`);
+  check('counts.active 与 entries 长度一致', okRes.json.counts.active === okRes.json.entries.length, `${okRes.json.counts.active} vs ${okRes.json.entries.length}`);
+  check('inbox 列出候选（memory_write 写过一条）', okRes.json.inbox.length >= 1 && okRes.json.inbox.every((e) => !!e.id && !!e.line), JSON.stringify(okRes.json.inbox).slice(0, 160));
+  check('响应是无损 JSON（没有 undefined 值）', losslessError(okRes.json) === null, losslessError(okRes.json) ?? '');
+  check('响应带 workspace（客户端据此反推）', okRes.json.workspace === cwdOfProject, String(okRes.json.workspace));
+
+  // 空请求体（客户端还没拿到 cwd 时就是这么发的）→ 仍然是 200 + ok:true
+  const noWs = await callRoute(route, { body: '' });
+  check('body 为空 → 仍 200 且 ok:true', noWs.status === 200 && noWs.json.ok === true, `${noWs.status} ${JSON.stringify({ ok: noWs.json.ok, error: noWs.json.error })}`);
+  check('body 为空时仍然给出配置的 root（客户端据此把面板画出来）', noWs.json.root === ROOT, String(noWs.json.root));
+  check('body 为空时 entries 照常返回', noWs.json.entries.length === okRes.json.entries.length, String(noWs.json.entries.length));
+  check('body 为空时 scope/workspace 是空串（而不是 undefined）', noWs.json.scope === '' && noWs.json.workspace === '', JSON.stringify({ scope: noWs.json.scope, workspace: noWs.json.workspace }));
+
+  // 没有 root 配置、workspace 又指向不存在目录：结构化的空状态，不是错误
+  const emptyRoute = createMemoryRoute((input) =>
+    memoryStateOf({ configRoot: undefined, workspace: input?.workspace }),
+  );
+  const missing = await callRoute(emptyRoute, { body: JSON.stringify({ workspace: path.join(SANDBOX, 'no-such-workspace') }) });
+  check('workspace 指向不存在的目录 → 200', missing.status === 200, String(missing.status));
+  check(
+    '不存在时 ok:true + 空数组（不是 4xx、不抛错）',
+    missing.json.ok === true && missing.json.entries.length === 0 && missing.json.due.length === 0 && missing.json.inbox.length === 0,
+    JSON.stringify({ ok: missing.json.ok, e: missing.json.entries.length, d: missing.json.due.length, i: missing.json.inbox.length }),
+  );
+  check(
+    '不存在时仍然给出 <workspace>/memory 作为 root（让用户看懂面板指向哪）',
+    missing.json.root === path.join(SANDBOX, 'no-such-workspace', 'memory'),
+    String(missing.json.root),
+  );
+  check('不存在时 counts 全 0', Object.values(missing.json.counts).every((v) => v === 0), JSON.stringify(missing.json.counts));
+  check('不存在时 scope 从 workspace 推出来', missing.json.scope === `workspace:${path.join(SANDBOX, 'no-such-workspace')}`, String(missing.json.scope));
+
+  // 来源校验：只接受回环来源
+  const badHost = await callRoute(route, { headers: { host: 'evil.example.com' }, body: '{}' });
+  check('非回环 Host → 403', badHost.status === 403, String(badHost.status));
+  check('403 带明确原因', /回环/.test(String(badHost.json.error)), JSON.stringify(badHost.json));
+  const noHost = await callRoute(route, { headers: {}, body: '{}' });
+  check('没有 Host 头 → 403', noHost.status === 403, String(noHost.status));
+  const crossSite = await callRoute(route, { headers: { host: '127.0.0.1:23278', 'sec-fetch-site': 'cross-site' }, body: '{}' });
+  check('sec-fetch-site: cross-site → 403', crossSite.status === 403, String(crossSite.status));
+  const badOrigin = await callRoute(route, { headers: { host: '127.0.0.1:23278', origin: 'http://evil.example.com' }, body: '{}' });
+  check('Origin 与 Host 不同源 → 403', badOrigin.status === 403, String(badOrigin.status));
+  const goodOrigin = await callRoute(route, { headers: { host: '127.0.0.1:23278', origin: 'http://127.0.0.1:23278' }, body: '{}' });
+  check('Origin 与 Host 同源（回环）→ 200', goodOrigin.status === 200, String(goodOrigin.status));
+  const localhostOrigin = await callRoute(route, { headers: { host: 'localhost:23278', origin: 'http://localhost:23278' }, body: '{}' });
+  check('localhost 也算回环', localhostOrigin.status === 200, String(localhostOrigin.status));
+
+  // 方法校验
+  const getRes = await callRoute(route, { method: 'GET', body: '' });
+  check('非 POST → 405', getRes.status === 405, String(getRes.status));
+  check('405 里说明收到的方法', /GET/.test(String(getRes.json.error)), JSON.stringify(getRes.json));
+
+  // body 校验
+  const badJson = await callRoute(route, { body: '{ 不是 json' });
+  check('body 不是 JSON → 400', badJson.status === 400, String(badJson.status));
+  check('400 带明确原因', /JSON/.test(String(badJson.json.error)), JSON.stringify(badJson.json));
+
+  // 记忆库读不了时也要回一条可读的 JSON，而不是断掉的连接
+  const brokenRoute = createMemoryRoute(() => {
+    throw new Error('模拟内部错误');
+  });
+  const brokenRes = await callRoute(brokenRoute, { body: '{}' });
+  check('handler 内部异常 → 500 且仍是 JSON', brokenRes.status === 500 && /模拟内部错误/.test(String(brokenRes.json.error)), JSON.stringify(brokenRes.json));
+
+  // 无 webServer 时必须优雅降级：不注册、不抛错、其余功能照旧
+  const headlessCtx = fakeCtx();
+  let headlessThrew = null;
+  try {
+    apply(headlessCtx, { root: ROOT });
+  } catch (error) {
+    headlessThrew = error;
+  }
+  check('没有 webServer 时不抛错（headless 优雅降级）', headlessThrew === null, headlessThrew ? String(headlessThrew.message) : '');
+  check('没有 webServer 时工具照旧注册', headlessCtx.registered.length === 2, String(headlessCtx.registered.length));
+  check('没有 webServer 时 pre-step 照旧注册', typeof headlessCtx.handlers.get('agent/pre-step') === 'function');
+  check('没有 webServer 时零告警噪音', headlessCtx.warnings.length === 0, JSON.stringify(headlessCtx.warnings));
+
+  // panel:false 关掉路由但保留其它
+  const offCtx = fakeCtxWithWebServer();
+  apply(offCtx, { root: ROOT, panel: false });
+  check('panel:false 时不注册路由', offCtx.routes.length === 0, String(offCtx.routes.length));
+  check('panel:false 时工具仍在', offCtx.registered.length === 2, String(offCtx.registered.length));
+
+  // registerMemoryRoute 的返回值与容错
+  check('webServer 缺失时 registerMemoryRoute 返回 null', registerMemoryRoute(undefined, memoryStateOf) === null);
+  const noEffectRoutes = [];
+  const returned = registerMemoryRoute({ register: (r) => noEffectRoutes.push(r) }, memoryStateOf);
+  check('没传 effect 时直接注册并返回路由对象', returned?.path === MEMORY_ROUTE_PATH && noEffectRoutes.length === 1, String(returned?.path));
 }
 
 /* ------------------------------------------------------------ 配置与容错 */

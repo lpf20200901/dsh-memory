@@ -1,0 +1,398 @@
+/**
+ * 「记忆」侧边栏页签的**宿主半边** —— 一条只读 JSON 路由。
+ *
+ * 客户端插件（`client/client.js`）拿不到磁盘，所以数据的唯一来源是这里。
+ * 这一层刻意做得很薄，而且**只做三件事**：
+ *   1. 把 `workspace` / 插件 `root` 配置解析成记忆库根目录；
+ *   2. 用**既有实现**（`bin/mem.mjs` 的 `injectPayload` / `readEntryFile`、
+ *      `src/due.mjs` 的 `collectDue`）拼出一份面板要的状态；
+ *   3. 在 webServer 上挂 `POST /dsh-memory-delta/state`，带来源校验。
+ *
+ * 为什么不另写一套解析：`mem tell` / `memory_search` / `mem due` 已经有一套，
+ * 面板再抄一份必然漂移 —— 面板显示"3 条常驻"而模型只收到 2 条，是最难查的那种 bug。
+ *
+ * 为什么用 POST 而不是 GET：workspace 是**绝对路径**（Windows 上是 `D:\...`），
+ * 放进 query 要两层编码，出错时只表现为"路径找不到"，很难查。POST 的 JSON body 一步到位，
+ * 而且天然绕开"GET 被缓存 / 被预取"的问题。
+ */
+
+import fs from 'node:fs';
+import path from 'node:path';
+
+import { CONFIG_FILE, ensureLayout, firstLine, injectPayload, readEntryFile, today } from '../bin/mem.mjs';
+import { collectDue } from './due.mjs';
+
+/** 路由路径：exact 匹配，只有这一个。（包名是 dsh-memory-delta，路由跟着包名走） */
+export const MEMORY_ROUTE_PATH = '/dsh-memory-delta/state';
+
+/** 面板一次最多列的常驻条目数 —— 面板是"给用户信心"的，不是监控台。 */
+export const PANEL_ENTRY_LIMIT = 200;
+
+/** 收件箱候选在状态里最多带几条（只带首行，足够"提示还有这些"。 */
+export const PANEL_INBOX_LIMIT = 50;
+
+/* ------------------------------------------------------------ 小工具 */
+
+/**
+ * 丢掉值为 `undefined` 的属性。
+ *
+ * DSH 的工具层要求**无损 JSON**（值为 undefined 的属性会让整个调用失败）。
+ * 这条 HTTP 路由不受那个校验约束，但保持同样的纪律有两个好处：
+ * 客户端不用区分「字段不存在」和「字段是 undefined」，而 `JSON.stringify`
+ * 本来就会把 undefined 静默丢掉 —— 与其让它悄悄消失，不如在这里显式去掉。
+ */
+function defined(obj) {
+  return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined));
+}
+
+/** 记忆库根目录是否真的存在（**绝不创建** —— 读路径不能有副作用）。 */
+function dirExists(p) {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 安全地读记忆库自己的 `memory.config.json`。
+ *
+ * ⚠️ **不能**直接调 `bin/mem.mjs` 的 `loadConfig`：它发现 JSON 非法时走 `fail()`
+ * → `process.exit(1)`。在 CLI 里这是对的，但在这里会把**整个 DSH 宿主进程**
+ * 干掉（用户只要手滑编辑坏一个文件，桌面版就没了）。所以这里自己读、自己容错。
+ *
+ * @returns {{budget: number|null, scope: string|null}}
+ */
+function safeConfig(root) {
+  const file = path.join(root, CONFIG_FILE);
+  try {
+    if (!fs.existsSync(file)) return { budget: null, scope: null };
+    const cfg = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return {
+      budget: Number.isFinite(cfg?.injectBudget) ? cfg.injectBudget : null,
+      scope: typeof cfg?.scope === 'string' && cfg.scope ? cfg.scope : null,
+    };
+  } catch {
+    // 配置坏了不是"面板打不开"的理由：退回默认预算，面板照常显示。
+    return { budget: null, scope: null };
+  }
+}
+
+/* ------------------------------------------------------------ 根目录解析 */
+
+/**
+ * 把一次请求解析成记忆库根目录。
+ *
+ * 顺序：**插件配置的 root 优先**（配了就用它，这是用户明确指定的库），
+ * 否则 `<workspace>/memory`。两者都没有（workspace 缺失）时返回 `null`，
+ * 由调用方给出"空状态"，而不是抛错 —— 客户端挂载时可能还不知道 cwd。
+ *
+ * @param {{configRoot?: string, workspace?: string}} input
+ * @returns {{root: string, workspace: string|null}}
+ */
+export function resolvePanelRoot({ configRoot, workspace } = {}) {
+  const ws = typeof workspace === 'string' && workspace.trim() ? path.resolve(workspace.trim()) : null;
+  if (typeof configRoot === 'string' && configRoot.trim()) {
+    return { root: path.resolve(configRoot.trim()), workspace: ws };
+  }
+  if (ws === null) return { root: null, workspace: null };
+  return { root: path.join(ws, 'memory'), workspace: ws };
+}
+
+/* ------------------------------------------------------------ 状态拼装 */
+
+/** 空状态：结构完整、数组为空 —— 客户端不需要为"还没有记忆库"写第二条渲染分支。 */
+function emptyState(root, scope, budget, workspace = null) {
+  return {
+    root: root ?? '',
+    scope: scope ?? '',
+    // workspace 让客户端**从响应里反推**该用哪个工作区（scope 里没带 cwd 时就能自愈）
+    workspace: workspace ?? String(scope || '').replace(/^workspace:/, ''),
+    today: today(),
+    budget,
+    bytes: 0,
+    entries: [],
+    due: [],
+    inbox: [],
+    counts: { active: 0, facts: 0, decisions: 0, inbox: 0, archive: 0, due: 0 },
+  };
+}
+
+/**
+ * 拼出面板要的完整状态。
+ *
+ * @param {{root: string}} L `ensureLayout` 的结果
+ * @param {{scope?: string|null, budget?: number|null, dueWithin?: number, entryLimit?: number, inboxLimit?: number}} [opts]
+ * @returns {object} 无损 JSON（没有 undefined 值）
+ */
+export function buildMemoryState(L, opts = {}) {
+  const budget = Number.isFinite(opts.budget) && opts.budget > 0 ? opts.budget : 3072;
+  // 注意：这里处理的是 `injectPayload` 的**扁平载荷条目**（scope 是字符串），
+  // 不是 mem.mjs 的原始条目（scope 在 `e.data.scope`）。以前在这里按 raw 形状取值，
+  // 结果整条路由回 500（"Cannot read properties of undefined (reading 'scope')"）。
+  const scopeOf = (e) => (typeof e?.scope === 'string' && e.scope ? e.scope : opts.scope || '');
+  const scope = opts.scope || '';
+  const entryLimit = Number.isFinite(opts.entryLimit) ? opts.entryLimit : PANEL_ENTRY_LIMIT;
+  const inboxLimit = Number.isFinite(opts.inboxLimit) ? opts.inboxLimit : PANEL_INBOX_LIMIT;
+  const dueWithin = Number.isFinite(opts.dueWithin) ? opts.dueWithin : 0;
+
+  // 注入载荷：**和插件推给模型的是同一个函数**，所以 bytes / entries 一定对得上。
+  // 用一个大预算调一次，拿到不截断的条目列表；再按真实预算调一次拿真实字节数。
+  const payload = injectPayload(L, budget);
+  const allEntries = injectPayload(L, Number.MAX_SAFE_INTEGER).entries;
+
+  // 到期复核：due.mjs 要 {id, line, date, verifyWhen}，这里从载荷里取（与 mem due 同源）。
+  const dueInput = payload.entries.map((e) => ({ id: e.id, line: e.line, date: e.date, verifyWhen: e.verifyWhen }));
+  const due = collectDue(dueInput, today(), { within: dueWithin });
+
+  const inboxEntries = inboxOf(L);
+  const counts = {
+    active: allEntries.length,
+    facts: allEntries.filter((e) => e.type === 'fact').length,
+    decisions: allEntries.filter((e) => e.type === 'decision').length,
+    inbox: inboxEntries.length,
+    archive: countMd(L.archive),
+    due: due.length,
+  };
+
+  return {
+    root: L.root,
+    scope,
+    workspace: String(scope || '').replace(/^workspace:/, ''),
+    today: today(),
+    budget,
+    bytes: payload.bytes,
+    entries: allEntries.slice(0, entryLimit).map((e) =>
+      defined({
+        id: e.id,
+        type: e.type,
+        key: e.key ?? undefined,
+        status: e.status,
+        tags: Array.isArray(e.tags) ? e.tags : [],
+        line: e.line,
+        verifyWhen: e.verifyWhen ?? undefined,
+        due: due.find((d) => d.id === e.id)?.due,
+        overdueDays: due.find((d) => d.id === e.id)?.overdueDays,
+        scope: scopeOf(e) || undefined,
+      }),
+    ),
+    due: due.map((d) =>
+      defined({
+        id: d.id,
+        line: d.line,
+        verifyWhen: d.verifyWhen,
+        due: d.due,
+        overdueDays: d.overdueDays,
+      }),
+    ),
+    inbox: inboxEntries.slice(0, inboxLimit).map((e) =>
+      defined({ id: e.id, type: e.data.type, line: firstLine(e.body), date: e.data.date }),
+    ),
+    counts,
+  };
+}
+
+/**
+ * 收件箱里的候选条目。
+ *
+ * 复用 `readEntryFile`（`mem show` / `readAll` 用的同一个解析器），不自己写一份
+ * frontmatter 解析 —— 两份解析必然漂移。
+ */
+function inboxOf(L) {
+  const out = [];
+  for (const file of listMd(L.inbox)) {
+    try {
+      out.push(readEntryFile(file));
+    } catch {
+      // 单个坏文件不该让整个面板打不开
+    }
+  }
+  out.sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  return out;
+}
+
+function listMd(dir) {
+  try {
+    return fs.readdirSync(dir).filter((f) => f.endsWith('.md')).map((f) => path.join(dir, f));
+  } catch {
+    return [];
+  }
+}
+
+function countMd(dir) {
+  return listMd(dir).length;
+}
+
+/**
+ * 只读地拼状态。
+ *
+ * @param {{configRoot?: string, workspace?: string, dueWithin?: number, entryLimit?: number, inboxLimit?: number, now?: string}} input
+ * @returns {object} `{ok:true, ...状态}`；任何输入异常都降级成空状态，**不抛错**
+ */
+export function memoryStateOf(input = {}) {
+  const { root, workspace } = resolvePanelRoot(input);
+  const cfg = root ? safeConfig(root) : { budget: null, scope: null };
+  const budget = cfg.budget ?? 3072;
+  const scope = cfg.scope ?? (workspace ? `workspace:${workspace}` : '');
+
+  if (!root || !dirExists(root)) {
+    // 记忆库还没建（全新工作区）是**正常状态**，不是错误：返回结构化的空状态。
+    // 仍然带 `ok: true` —— spec 明确要求"workspace 缺失或目录不存在 → ok:true + 空数组"，
+    // 客户端因此只需要一条"没有记忆"的渲染分支，不用去分辨"空"和"坏"。
+    return { ok: true, ...emptyState(root ?? '', scope, budget, workspace) };
+  }
+
+  try {
+    const L = ensureLayout(root, { create: false });
+    const state = buildMemoryState(L, {
+      scope,
+      budget,
+      dueWithin: input.dueWithin,
+      entryLimit: input.entryLimit,
+      inboxLimit: input.inboxLimit,
+    });
+    return { ok: true, ...state };
+  } catch (error) {
+    return {
+      ...emptyState(root, scope, budget, workspace),
+      ok: false,
+      error: `读取记忆库失败：${error?.message ?? String(error)}`,
+    };
+  }
+}
+
+/* ------------------------------------------------------------ 路由 */
+
+/** 回环主机名判定 —— 与 `dsh-better-sidebar` 的 `isLoopbackHostname` 同一套规则。 */
+function isLoopbackHostname(hostname) {
+  if (hostname === 'localhost' || hostname === '[::1]') return true;
+  const parts = String(hostname).split('.');
+  return parts.length === 4 && parts[0] === '127' && parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255);
+}
+
+/**
+ * 来源校验（照 `dsh-better-sidebar` 的 `fence` 做同等级别的检查）。
+ *
+ * 那条 fence 是 `isTrustedApiRequest(req, ctx.webRuntime.trustedHosts)`
+ * （`dsh-better-sidebar/src/index.ts:719`），语义是：
+ *   · Host 头必须能解析、且是回环地址或用户配置的可信 authority；
+ *   · `sec-fetch-site: cross-site` 拒绝（跨站页面）；
+ *   · `Origin` 若存在，其 hostname 必须就是本机 Host 的 hostname（缺 Origin 允许）。
+ *
+ * 这里**只接受回环**：本插件没有 `webRuntime`（那是 web 组合的另一项服务），
+ * 拿不到用户配置的可信 host 列表。宁可拒绝一个自定义域名下的 GUI，也不放宽 ——
+ * 这条路由会把用户记忆库里的**结论正文**原样吐出来。
+ */
+export function isTrustedLoopbackRequest(req) {
+  const headers = req?.headers ?? {};
+  const host = typeof headers.host === 'string' ? headers.host : undefined;
+  if (!host) return false;
+  let hostUrl;
+  try {
+    hostUrl = new URL(`http://${host}`);
+  } catch {
+    return false;
+  }
+  if (!isLoopbackHostname(hostUrl.hostname)) return false;
+  if (headers['sec-fetch-site'] === 'cross-site') return false;
+  const origin = typeof headers.origin === 'string' ? headers.origin : undefined;
+  if (origin === undefined) return true;
+  try {
+    return new URL(origin).hostname === hostUrl.hostname;
+  } catch {
+    return false;
+  }
+}
+
+/** 读 JSON body（带上限，防止有人往这里灌无界数据）。 */
+function readJsonBody(req, limit = 64 * 1024) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > limit) {
+        reject(new Error('请求体过大'));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      const text = Buffer.concat(chunks).toString('utf8').trim();
+      if (!text) {
+        resolve({});
+        return;
+      }
+      try {
+        const parsed = JSON.parse(text);
+        resolve(parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {});
+      } catch {
+        reject(new Error('请求体不是合法 JSON'));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+function writeJson(res, status, value) {
+  const body = JSON.stringify(value);
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+  res.end(body);
+}
+
+/**
+ * 造一个 webServer 路由对象：`{kind, path, handler}`。
+ *
+ * handler 是 node:http 的 `(req, res)`。四条出口写死在这里，顺序即优先级：
+ * 来源不合 → 403；非 POST → 405；body 不是 JSON → 400；其余 → 200。
+ * **任何情况下都回 JSON**，客户端不必猜响应体是什么。
+ *
+ * @param {(input: {configRoot?: string, workspace?: string, dueWithin?: number}) => object} stateOf
+ * @returns {{kind: 'exact', path: string, handler: (req, res) => Promise<void>}}
+ */
+export function createMemoryRoute(stateOf) {
+  return {
+    kind: 'exact',
+    path: MEMORY_ROUTE_PATH,
+    async handler(req, res) {
+      try {
+        if (!isTrustedLoopbackRequest(req)) {
+          writeJson(res, 403, { ok: false, error: '只允许来自本机回环地址的请求' });
+          return;
+        }
+        if (req.method !== 'POST') {
+          writeJson(res, 405, { ok: false, error: `只支持 POST，收到 ${req.method ?? '未知方法'}` });
+          return;
+        }
+        let body;
+        try {
+          body = await readJsonBody(req);
+        } catch (error) {
+          writeJson(res, 400, { ok: false, error: error.message });
+          return;
+        }
+        writeJson(res, 200, stateOf(body));
+      } catch (error) {
+        // 兜底：handler 里任何意外都必须变成一条可读的 JSON，而不是断掉的连接
+        writeJson(res, 500, { ok: false, error: `内部错误：${error?.message ?? String(error)}` });
+      }
+    },
+  };
+}
+
+/**
+ * 注册路由。
+ *
+ * @param {object} webServer `ctx.get('webServer')` 的结果
+ * @param {(input: object) => object} stateOf
+ * @param {(body: () => any, label?: string) => unknown} [effect] `ctx.effect` —— 传了就按
+ *   Cordis 的方式托管这条副作用（销毁时自动摘掉路由）；不传（测试里）则直接注册。
+ * @returns {object|null} 路由对象；webServer 不可用时返回 null
+ */
+export function registerMemoryRoute(webServer, stateOf, effect) {
+  if (!webServer || typeof webServer.register !== 'function') return null;
+  const route = createMemoryRoute(stateOf);
+  if (typeof effect === 'function') effect(() => webServer.register(route), 'dsh-memory-delta: /dsh-memory-delta/state route');
+  else webServer.register(route);
+  return route;
+}

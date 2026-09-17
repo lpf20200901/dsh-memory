@@ -1,6 +1,7 @@
 # 运行/测试产物
 node_modules/
-.test-sandbox/
+.test-sandbox/         # 旧路径（留着，免得历史残留被提交）
+.test-sandbox-*/       # 按进程分的测试沙箱：两套测试并行跑不会互相覆盖（见 test/run-tests.mjs 注释）
 .preflight-store/
 .tmp-*/
 .dbg/

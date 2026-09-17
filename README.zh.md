@@ -1,4 +1,4 @@
-# dsh-memory
+# dsh-memory-delta
 
 [English](README.md) | 中文
 
@@ -6,8 +6,8 @@
 一个 DSH 插件 + 一个零依赖的独立 CLI。借鉴 [OpenSpec](https://github.com/Fission-AI/OpenSpec) 的
 *规格 / 变更 / 归档* 纪律 —— 但走**推送**而不是拉取。
 
-> **主仓库：[GitHub](https://github.com/lpf20200901/dsh-memory)** ·
-> [Gitee](https://gitee.com/xingluzhe/dsh-memory) 是只读镜像 ——
+> **主仓库：[GitHub](https://github.com/lpf20200901/dsh-memory-delta)** ·
+> [Gitee](https://gitee.com/xingluzhe/dsh-memory-delta) 是只读镜像 ——
 > **issue / PR 请提到 GitHub**，提到镜像站会丢。
 
 > 状态：**M1–M3 已完成并在真实 DSH 上实机验证**（差分注入 / 两个工具 / 蒸馏提醒）。
@@ -21,7 +21,7 @@ AI 编码助手有两个反复出现的毛病：
 2. **记住了也管不好** —— 全塞进一两个 Markdown，越写越大、越写越贵，而且**结论过时了没人删**。
 
 已有的规格驱动工具（OpenSpec 等）解决的是"代码不跑偏"，但它们是**拉取式**：靠指令要求 AI 去读，
-新会话不会主动想起来。dsh-memory 走**推送**：会话一开始就把该知道的塞进上下文，但**只推最精炼的部分**，
+新会话不会主动想起来。dsh-memory-delta 走**推送**：会话一开始就把该知道的塞进上下文，但**只推最精炼的部分**，
 而且**只推变化的部分**，细节按需检索。
 
 ## 设计要点
@@ -75,7 +75,7 @@ AI 编码助手有两个反复出现的毛病：
 1. 把本包放进 profile 的 `node_modules`：
 
    ```
-   <DSH_HOME>\profiles\web\node_modules\dsh-memory\
+   <DSH_HOME>\profiles\web\node_modules\dsh-memory-delta\
        package.json
        bin\mem.mjs
        src\plugin.mjs  src\hook.mjs  src\planner.mjs
@@ -85,8 +85,8 @@ AI 编码助手有两个反复出现的毛病：
 
    ```yaml
    - insert:
-       - id: dsh-memory
-         name: dsh-memory
+       - id: dsh-memory-delta
+         name: dsh-memory-delta
          config:
            root: ''          # 留空 = 会话工作目录下的 memory/
            maxBytes: 3072    # baseline 注入的字节预算
@@ -95,7 +95,7 @@ AI 编码助手有两个反复出现的毛病：
 
 3. 保存即可 —— patch 层有 `watchUserPatches`，**会热加载，不需要重启**。
 
-**卸载**：删掉 patch 里那段 `- insert:`，再删掉 `node_modules\dsh-memory` 目录。
+**卸载**：删掉 patch 里那段 `- insert:`，再删掉 `node_modules\dsh-memory-delta` 目录。
 
 > 官方分发渠道（插件市场）的发布流程我还没摸；目前是本机安装方式。
 
@@ -108,9 +108,12 @@ AI 编码助手有两个反复出现的毛病：
 | `memory_write` | 把候选条目写进 inbox —— **模型不允许直接改事实层** |
 | 蒸馏提醒 | 会话跑过若干轮而记忆已是最新时，提醒模型把本次结论落到 inbox；每会话只提醒一次，且提醒消息**不带状态**，不污染差分基线 |
 | 到期复核提醒 | `verify_when` 不再是死字段：条目到了当初约定的复核期，会话里会**提醒一次**"这条结论可能过时了，请复核"，并给出该用哪条命令取代/标过期。写成**人话**的值（`等换机器时`）永远不会触发它（否则每个会话都弹一次、怎么改都消不掉）；只在"本轮本来不注入任何记忆"时才提醒，同样**不带状态** |
+| 侧边栏「记忆」页签 | 装了 [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) 后，侧边栏多一个**记忆**页：常驻条目、到期待复核项、收件箱候选，以及当前注入体积。客户端半边是**手写的零构建浏览器 bundle**（`window.__ModuleLoader__.load({id, factory})` 包装，不引入任何打包器）；数据来自本插件自己的只读路由 `POST /dsh-memory-delta/state` —— 仅回环、JSON 进 JSON 出、只读记忆库，不碰别的文件 |
 
 为什么插件**不去 spawn CLI**：DSH 沙箱禁止命名管道，捕获子进程输出会 EPERM；而且没必要 ——
 插件直接 `import` 同一份 store 逻辑（`bin/mem.mjs` 只在被直接执行时才跑 CLI）。
+它也不**强依赖**侧边栏：`webServer` 是通过 `ctx.get('webServer')` 读的**可选能力**，
+所以 headless / 纯 CLI 组合下插件照常加载，只是不注册面板路由。
 
 ## CLI 用法
 
