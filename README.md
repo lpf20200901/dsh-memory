@@ -7,6 +7,10 @@ A [DSH](https://github.com/deepseek-ai/deepseek-harness) (DeepSeek Harness) plug
 zero-dependency standalone CLI. It borrows the *spec / change / archive* discipline from
 [OpenSpec](https://github.com/Fission-AI/OpenSpec) — but **pushes** instead of pulls.
 
+> **Canonical repository: [GitHub](https://github.com/lpf20200901/dsh-memory)** ·
+> [Gitee](https://gitee.com/xingluzhe/dsh-memory) is a read-only mirror —
+> please file issues and pull requests on GitHub.
+
 > Status: **M1–M3 done and verified inside a real DSH session** (differential injection, both tools,
 > the distillation nudge). See [Verification](#verification).
 

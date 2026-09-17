@@ -6,6 +6,10 @@
 一个 DSH 插件 + 一个零依赖的独立 CLI。借鉴 [OpenSpec](https://github.com/Fission-AI/OpenSpec) 的
 *规格 / 变更 / 归档* 纪律 —— 但走**推送**而不是拉取。
 
+> **主仓库：[GitHub](https://github.com/lpf20200901/dsh-memory)** ·
+> [Gitee](https://gitee.com/xingluzhe/dsh-memory) 是只读镜像 ——
+> **issue / PR 请提到 GitHub**，提到镜像站会丢。
+
 > 状态：**M1–M3 已完成并在真实 DSH 上实机验证**（差分注入 / 两个工具 / 蒸馏提醒）。
 > 实机验证矩阵见下方「验证」。
 
