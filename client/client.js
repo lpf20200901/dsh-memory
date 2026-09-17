@@ -22,7 +22,7 @@
 
 window.__ModuleLoader__.load({
   // ⚠️ id 必须是**包名**：宿主用"解析出的包名"作为浏览器模块身份，
-  // 写成别的（旧名 dsh-memory-delta）会直接对不上，页签静默不出现。
+  // 写成别的（比如改名前那个 dsh-memory）会直接对不上，页签静默不出现。
   id: 'dsh-memory-delta',
   factory: (require) => {
     var module = { exports: {} };

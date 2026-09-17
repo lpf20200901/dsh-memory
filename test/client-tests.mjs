@@ -200,7 +200,7 @@ section('在假 window 里执行：注册了 id = dsh-memory-delta 的 factory')
   }
   check('执行不抛异常', thrown === null, thrown ? `${thrown.name}: ${thrown.message}` : '');
   check('load 恰好被调用一次', loaded?.calls.length === 1, String(loaded?.calls.length));
-  // 宿主用"解析出的包名"当浏览器模块身份 —— 写成旧名 dsh-memory-delta 会对不上，页签静默不出现
+  // 宿主用"解析出的包名"当浏览器模块身份 —— 写成改名前那个 dsh-memory 会对不上，页签静默不出现
   check('注册的 id 是包名 dsh-memory-delta', loaded?.calls[0]?.id === 'dsh-memory-delta', String(loaded?.calls[0]?.id));
   check('factory 是函数', typeof loaded?.factory === 'function');
 }
