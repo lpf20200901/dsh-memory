@@ -330,7 +330,31 @@ section('组件：超预算');
   await flush();
   const text = allText(mounted.tree());
   check('超出预算时明确标出', text.includes('注入 4096 / 3072 字节') && text.includes('超出预算'), text.slice(0, 240));
-  check('没有到期项时说清楚', text.includes('没有到复核期的记忆'), text.slice(0, 400));
+  check(
+    '没有到期项时说清楚"什么时候才会出现"',
+    text.includes('没有到复核期的记忆') && text.includes('verify_when 到期后才会出现'),
+    text.slice(0, 400),
+  );
+  globalThis.fetch = originalFetch;
+}
+
+/* ------------------------------------------------------- 组件：空态文案 */
+
+section('组件：空态文案（没有任何数据时不能让人以为是坏了）');
+{
+  const originalFetch = globalThis.fetch;
+  // 空收件箱最容易让人误会成"面板读的是文件夹吗/是不是坏了"—— 文案必须说清它为什么空
+  const empty = { ...SAMPLE, due: [], inbox: [], counts: { ...SAMPLE.counts, due: 0, inbox: 0 } };
+  globalThis.fetch = () => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(empty) });
+  const mounted = mountPanel({ scope: { sessionId: 's1', cwd: 'D:\\proj' } });
+  await flush();
+  const text = allText(mounted.tree());
+  check(
+    '空收件箱时说明"模型写了才会出现，空着正常"',
+    text.includes('还没有待确认的候选') && text.includes('memory_write') && text.includes('空着是正常的'),
+    text.slice(0, 400),
+  );
+  check('空收件箱时依然保留"确认后才成为常驻记忆"的说明', text.includes('确认后才成为常驻记忆'), text.slice(0, 400));
   globalThis.fetch = originalFetch;
 }
 

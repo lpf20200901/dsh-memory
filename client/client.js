@@ -304,7 +304,11 @@ window.__ModuleLoader__.load({
           h('span', { className: 'dsh-memory-delta-dim' }, `（${dueList.length}）`),
         ),
         dueList.length === 0
-          ? h('div', { className: 'dsh-memory-delta-muted dsh-memory-delta-empty' }, '没有到复核期的记忆')
+          ? h(
+              'div',
+              { className: 'dsh-memory-delta-muted dsh-memory-delta-empty' },
+              '没有到复核期的记忆 —— 条目的 verify_when 到期后才会出现在这里（mem due 看全量）',
+            )
           : dueList.map((d) =>
               h(
                 'div',
@@ -363,7 +367,11 @@ window.__ModuleLoader__.load({
           null,
           h('div', { className: 'dsh-memory-delta-dim' }, '确认后才成为常驻记忆（promote 之后才会被注入）。'),
           inbox.length === 0
-            ? h('div', { className: 'dsh-memory-delta-muted dsh-memory-delta-empty' }, '收件箱是空的')
+            ? h(
+                'div',
+                { className: 'dsh-memory-delta-muted dsh-memory-delta-empty' },
+                '还没有待确认的候选 —— 模型用 memory_write 写了结论才会出现在这里，空着是正常的',
+              )
             : inbox.map((e) => item(e.id, e.line, h('div', { className: 'dsh-memory-delta-dim' }, `${e.type || '—'}${e.date ? ` · ${e.date}` : ''}`))),
         ),
       );
