@@ -235,31 +235,41 @@ export function apply(ctx, config = {}) {
   );
 
   /* ------------------------------------------- 侧边栏「记忆」页签的数据路由 */
-  // webServer 是**可选**依赖：headless / CLI 组合里没有它。
-  // 用 `ctx.get('webServer')` 而不是把它写进 `inject` —— Cordis 的 inject 是**硬依赖**，
-  // 声明了就会让整个插件在 webServer 出现前一直 PENDING（headless 下等于插件根本不加载）。
-  // 依据：`cordis-plugin-development` 技能 "Access Services" 一节（`ctx.get(name)` 读可选能力、
-  // 只有硬依赖才写 `inject`），以及 `ctx.get` 的实现 cordis/src/reflect.ts:233。
+  // webServer 是**可选**依赖：headless / CLI 组合里没有它，所以不能写进 `inject`
+  // （Cordis 的 `inject` 是硬依赖，声明了插件会一直 PENDING 直到服务出现）。
   //
-  // 页面半边的注册在 client/client.js，它只认 `registerTab`；路由没有注册成功时
-  // （webServer 缺失或 panel:false），页签会显示明确的错误行，而不是一片空白。
+  // ⚠️ 但也不能用 `ctx.get('webServer')` 一眼定生死 —— **实测踩到**：
+  // 本插件的行插在用户 patch 层里，apply 那一刻 webServer 可能还没就绪，`ctx.get`
+  // 返回 undefined，于是路由**静默没注册**；页签照常出现，点开时报 "HTTP 405"，
+  // 因为未知路径落到 SPA 回退，而那个服务器对非 GET 一律 405 —— 看起来像"方法不对"，
+  // 实际是"路由压根不存在"。（排查方式：`GET /<路径>` 得 404、POST 得 405 = 回退在答；
+  // 已注册的路径会用自己的语义回答，比如 better-sidebar 的 /sidebar/api 前缀回自己的 404。）
+  //
+  // 正确姿势是 `ctx.inject(deps, cb)`：**等服务可用之后**才跑回调，服务消失/重建时
+  // fork 会被卸载重跑（cordis/src/registry.ts 的 RegistryService.inject）。
+  const registerPanelRoute = (target, effectOwner) => {
+    // root 优先：配了插件 root 就以它为准（用户在别处维护的记忆库）；
+    // 否则 <workspace>/memory。客户端把 scope.cwd 作为 workspace 传进来。
+    registerMemoryRoute(
+      target,
+      (input) =>
+        memoryStateOf({
+          configRoot: config.root || undefined,
+          workspace: input?.workspace,
+          dueWithin: config.dueWithin ?? 0,
+        }),
+      effectOwner?.effect?.bind(effectOwner) ?? ctx.effect?.bind(ctx),
+    );
+  };
+
   if (config.panel !== false) {
-    const webServer = ctx.get?.('webServer');
-    if (webServer) {
-      // root 优先：配了插件 root 就以它为准（用户在别处维护的记忆库）；
-      // 否则 <workspace>/memory。客户端把 scope.cwd 作为 workspace 传进来。
-      registerMemoryRoute(
-        webServer,
-        (input) =>
-          memoryStateOf({
-            configRoot: config.root || undefined,
-            workspace: input?.workspace,
-            dueWithin: config.dueWithin ?? 0,
-          }),
-        ctx.effect?.bind(ctx),
-      );
+    if (typeof ctx.inject === 'function') {
+      ctx.inject(['webServer'], (forkCtx) => registerPanelRoute(forkCtx.webServer, forkCtx));
     } else {
-      ctx.logger?.debug?.('memory: 没有 webServer，跳过侧边栏「记忆」页签的数据路由');
+      // 极简 / 老版本 ctx（测试替身走这条）：退回到"读一下，有就注册"
+      const webServer = ctx.get?.('webServer');
+      if (webServer) registerPanelRoute(webServer, ctx);
+      else ctx.logger?.debug?.('memory: 没有 ctx.inject，且当前拿不到 webServer，跳过面板路由');
     }
   }
 

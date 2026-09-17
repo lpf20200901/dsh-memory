@@ -99,26 +99,52 @@ function fakeCtx() {
 
 /**
  * 带 webServer 的假 ctx —— 用来验证「记忆」页签那条只读路由的**真实接线**。
- * 同时记录 ctx.effect 的用法（路由必须走 effect 托管，否则卸载后路由还在）。
+ *
+ * 关键：假 ctx 实现 `inject(deps, cb)`（cordis 的真实语义是"服务可用后才跑回调"），
+ * 并且**默认模拟"webServer 晚于 apply 才出现"**：这正是真机上踩到的 bug ——
+ * 用 `ctx.get('webServer')` 在 apply 那一刻读，拿到 undefined，路由静默没注册，
+ * 页签点开只报 "HTTP 405"（未知路径落到 SPA 回退）。
+ *
+ * @param {{ late?: boolean }} [opts] late=true（默认）：回调先存起来，由测试手动触发；
+ *   late=false：`inject` 立刻执行回调，模拟服务早就就绪
  */
-function fakeCtxWithWebServer() {
+function fakeCtxWithWebServer({ late = true } = {}) {
   const ctx = fakeCtx();
   const routes = [];
   const effects = [];
+  const pending = [];
   ctx.routes = routes;
   ctx.effects = effects;
+  ctx.pendingInjects = pending;
+  const server = {
+    register(route) {
+      routes.push(route);
+      return () => {};
+    },
+  };
   ctx.effect = (fn, label) => {
     effects.push(label);
     return fn();
   };
-  ctx.get = (name) => {
-    if (name !== 'webServer') return undefined;
-    return {
-      register(route) {
-        routes.push(route);
-        return () => {};
-      },
+  ctx.get = (name) => (name === 'webServer' ? server : undefined);
+  ctx.inject = (deps, callback) => {
+    const names = Array.isArray(deps) ? deps : Object.keys(deps);
+    const run = () => {
+      const fork = fakeCtx();
+      fork.effect = ctx.effect;
+      Object.assign(fork, { webServer: server });
+      callback(fork);
     };
+    if (names.includes('webServer')) {
+      if (late) {
+        pending.push(run);
+        return { dispose() {} };
+      }
+      run();
+      return { dispose() {} };
+    }
+    // 其它依赖：本插件没有，直接拒绝以暴露写错依赖的情况
+    throw new Error(`fakeCtxWithWebServer: 意外的 inject 依赖 ${names.join(',')}`);
   };
   return ctx;
 }
@@ -438,10 +464,17 @@ section('侧边栏「记忆」页签：只读 JSON 路由');
   const r3 = resolvePanelRoot({});
   check('workspace 缺失时返回根目录 null（调用方给空状态，不抛错）', r3.root === null, String(r3.root));
 
-  // 真接线：apply 时 ctx.get('webServer') 给出服务 → 注册一条 exact 路由
-  const panelCtx = fakeCtxWithWebServer();
+  // 真接线：apply 时 webServer **还没就绪**（真机就是这样）→ 走 ctx.inject 等它出现
+  const panelCtx = fakeCtxWithWebServer(); // late=true：回调先挂着
   apply(panelCtx, { root: ROOT, maxBytes: 3072, dueWithin: 0 });
-  check('注册了恰好 1 条路由（工具仍是 2 个）', panelCtx.routes.length === 1 && panelCtx.registered.length === 2, String(panelCtx.routes.length));
+  // 回归（真机踩到）：这里如果断言 0 条路由就说明又退回"apply 时 ctx.get 一眼定生死"了，
+  // 那时页签会出现、点开只报 HTTP 405（未知路径落到 SPA 回退）
+  check('apply 那一刻还没 webServer → 不注册（也不报错）', panelCtx.routes.length === 0, String(panelCtx.routes.length));
+  check('用 ctx.inject 挂了一个等待 webServer 的回调', panelCtx.pendingInjects.length === 1, String(panelCtx.pendingInjects.length));
+  check('工具照常注册（不等 webServer）', panelCtx.registered.length === 2, String(panelCtx.registered.length));
+
+  panelCtx.pendingInjects[0](); // webServer 出现了
+  check('webServer 出现后注册了恰好 1 条路由', panelCtx.routes.length === 1, String(panelCtx.routes.length));
   const route = panelCtx.routes[0];
   check('路由 kind 是 exact', route.kind === 'exact', String(route.kind));
   check('路由路径是 /dsh-memory-delta/state', route.path === MEMORY_ROUTE_PATH && route.path === '/dsh-memory-delta/state', String(route.path));
@@ -453,8 +486,31 @@ section('侧边栏「记忆」页签：只读 JSON 路由');
   check('客户端 fetch 的 URL 与宿主路由路径完全一致', clientUrl === MEMORY_ROUTE_PATH, `${clientUrl} vs ${MEMORY_ROUTE_PATH}`);
   const clientId = /id:\s*'([^']+)',\s*\n\s*factory:/.exec(clientSrc)?.[1];
   check('客户端 bundle 的 id 是包名 dsh-memory-delta', clientId === 'dsh-memory-delta', String(clientId));
+  // 客户端必须用 POST —— 宿主路由只认 POST，用 GET 会得到 405（而且回退服务器也回 405，极易误判）
+  check('客户端用 POST 请求这条路由', /fetch\(STATE_URL,\s*\{\s*\n\s*method:\s*'POST'/.test(clientSrc), 'client/client.js 里的 fetch 选项');
   check('路由通过 ctx.effect 托管（可随插件卸载）', panelCtx.effects.length === 1, JSON.stringify(panelCtx.effects));
   check('effect 带可读的标签（含新包名）', panelCtx.effects[0] === 'dsh-memory-delta: /dsh-memory-delta/state route', String(panelCtx.effects[0]));
+
+  // 服务早就就绪的组合（late=false）→ 回调立刻跑
+  const earlyCtx = fakeCtxWithWebServer({ late: false });
+  apply(earlyCtx, { root: ROOT, maxBytes: 3072 });
+  check('webServer 早已就绪时也注册', earlyCtx.routes.length === 1, String(earlyCtx.routes.length));
+
+  // 没有 ctx.inject 的极简 ctx（老版本 / 测试替身）→ 退回 ctx.get，有就注册、没有不抛
+  const plainCtx = fakeCtx();
+  plainCtx.get = (n) => (n === 'webServer' ? { register: () => () => {} } : undefined);
+  let plainThrew = null;
+  try {
+    apply(plainCtx, { root: ROOT });
+  } catch (error) {
+    plainThrew = error;
+  }
+  check('没有 ctx.inject 时不抛错（退回 ctx.get）', plainThrew === null, String(plainThrew?.message));
+
+  // panel:false → 连等待都不挂
+  const offPanelCtx = fakeCtxWithWebServer();
+  apply(offPanelCtx, { root: ROOT, panel: false });
+  check('panel:false 时不注册也不等待', offPanelCtx.routes.length === 0 && offPanelCtx.pendingInjects.length === 0, `${offPanelCtx.routes.length}/${offPanelCtx.pendingInjects.length}`);
 
   // 正常：POST + 回环来源
   // 临时库：专门用来钉"到期条目"的展示形状（共享库里的 stale-fact 在别处被改成
