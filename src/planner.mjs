@@ -27,9 +27,25 @@ export function escapeFraming(text) {
   return String(text).replaceAll('</system-reminder>', '<\\/system-reminder>');
 }
 
+/** 防止单条超长结论独占预算的展示上限（正文才是给人看的）。 */
+export const LINE_CAP = 140;
+
+const clip = (text, cap = LINE_CAP) => {
+  const t = String(text ?? '').trim();
+  return t.length > cap ? `${t.slice(0, cap - 1)}…` : t;
+};
+
+/**
+ * 渲染一条记忆。
+ *
+ * ⚠️ **故意不写 id**：id 是机器用来做差分的元数据，已经随消息的 `source.entries`
+ * 结构化携带（见 sourceEntries），把它再写进正文只会白占注入预算 ——
+ * 实测它曾占掉**全部注入字节的 40%**（1066 字节里 431 是 id）。
+ * 去掉后 3 KB 预算能装的条目从约 17 条升到约 29 条。
+ */
 const label = (e) => {
   const key = e.key ? ` [${e.key}]` : '';
-  return `- ${escapeFraming(e.line)}${key}  <!-- ${e.id} -->`;
+  return `- ${escapeFraming(clip(e.line))}${key}`;
 };
 
 function groupByType(entries) {

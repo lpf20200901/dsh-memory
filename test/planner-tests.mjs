@@ -5,6 +5,7 @@
  */
 
 import {
+  LINE_CAP,
   MEMORY_SOURCE_KIND,
   escapeFraming,
   planInjection,
@@ -99,6 +100,23 @@ section('渲染与框架转义');
   check('baseline 分节事实/决策', b.includes('### 事实') && b.includes('### 决策'), b.slice(0, 200));
   check('baseline 带 key 标记', renderBaseline([entry('k', 'h', { key: 'my-key' })]).includes('[my-key]'));
   check('空集合 → 空文本', renderBaseline([]) === '');
+
+  // 回归：id 是差分元数据，走 source.entries；写进正文只会白占注入预算（实测占 40%）
+  // 故意让正文不含 id，才能验出「id 是从正文里删掉的」而不是「正文恰好没提」
+  const withIds = renderBaseline([entry('alpha-id', 'h1', { line: '结论一' }), entry('beta-id', 'h2', { type: 'decision', line: '结论二' })]);
+  check('baseline 正文不出现条目 id', !withIds.includes('<!--') && !withIds.includes('alpha-id') && !withIds.includes('beta-id'), withIds);
+  const deltaText = planInjection([entry('gamma-id', 'h3', { line: '新结论' })], { zeta: 'h0' }).text;
+  check('delta 正文不出现条目 id', !deltaText.includes('<!--') && !deltaText.includes('gamma-id'), deltaText);
+  // 但已失效列表是例外：删掉的条目只剩 id 可用
+  check('已失效列表仍用 id 指认', deltaText.includes('zeta'), deltaText);
+  check('状态里依然完整保留 id → hash', stateOf([entry('alpha-id', 'h1')])['alpha-id'] === 'h1');
+
+  // 超长单条会挤爆预算 —— 按行截断（LINE_CAP 管结论正文，行首还有 "- "）
+  const long = renderBaseline([entry('l', 'h', { line: 'x'.repeat(400) })]);
+  const longLine = long.split('\n').find((l) => l.startsWith('- '));
+  check(`超长条目正文被截到 ${LINE_CAP} 字`, longLine.length <= LINE_CAP + 2, String(longLine.length));
+  check('截断有省略号提示', longLine.endsWith('…'), longLine.slice(-8));
+  check('未超长的不动', renderBaseline([entry('s', 'h', { line: '短的' })]).includes('- 短的'));
 }
 
 /* ------------------------------------------------- 从会话历史恢复状态 */

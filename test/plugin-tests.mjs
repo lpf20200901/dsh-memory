@@ -154,7 +154,10 @@ const preStep = ctx.handlers.get('agent/pre-step');
   check('第 3 轮插入 1 条', o3.messages.length === d3.messages.length + 1, String(o3.messages.length));
   const delta = o3.messages.find((m) => m.source?.kind === MEMORY_SOURCE_KIND && m.content[0].text.includes('新增'));
   check('第 3 轮推的是 delta', !!delta, JSON.stringify(o3.messages.map((m) => m.content[0].text.slice(0, 24))));
-  check('delta 只含新条目', delta && /new-fact/.test(delta.content[0].text) && !/known-fact/.test(delta.content[0].text), delta?.content[0].text.slice(0, 120));
+  check('delta 只含新条目', delta && /沙箱禁管道/.test(delta.content[0].text) && !/rmSync/.test(delta.content[0].text), delta?.content[0].text.slice(0, 120));
+  // 回归：id 只走 source.entries，不进正文（曾占掉 40% 注入字节）
+  check('注入正文不含 id 注释', delta && !delta.content[0].text.includes('<!--'), delta?.content[0].text.slice(0, 120));
+  check('baseline 正文也不含 id 注释', !baseline.content[0].text.includes('<!--'), baseline.content[0].text.slice(0, 120));
 }
 
 /* ------------------------------------------------------------------ 工具 */

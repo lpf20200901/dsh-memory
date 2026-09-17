@@ -17,6 +17,8 @@ import process from 'node:process';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
+import { renderBaseline } from '../src/planner.mjs';
+
 const VERSION = '0.1.0';
 const CONFIG_FILE = 'memory.config.json';
 const TYPES = ['fact', 'decision'];
@@ -603,18 +605,23 @@ function entryHash(e) {
     .slice(0, 12);
 }
 
-/** 渲染「应该注入的内容」——插件将来直接调这个（或 --json 拿结构化载荷）。 */
+/**
+ * 渲染「应该注入的内容」。
+ *
+ * **和插件共用同一套渲染**（`src/planner.mjs` 的 `renderBaseline`）—— 否则
+ * `mem inject` 显示的文本、以及 validate 算出来的字节数，都会和真正注入的内容不一致
+ * （历史教训：这里曾自己拼一份、还往每行塞 `<!-- id -->`，白占 40% 预算）。
+ */
 function renderInject(L) {
-  const entries = activeEntries(L);
-  const out = [];
-  for (const [title, dir] of [['事实', 'facts'], ['决策', 'decisions']]) {
-    const list = entries.filter((e) => e.where === dir);
-    if (!list.length) continue;
-    out.push(`### ${title}`);
-    for (const e of list) out.push(`- ${firstLine(e.body)}  <!-- ${e.id} -->`);
-    out.push('');
-  }
-  return out.join('\n').trim();
+  return renderBaseline(
+    activeEntries(L).map((e) => ({
+      id: e.id,
+      type: e.data.type,
+      key: e.data.key || null,
+      hash: entryHash(e),
+      line: firstLine(e.body),
+    })),
+  );
 }
 
 /** 差分注入用的结构化载荷：每条带 hash，插件据此只推变化块。 */

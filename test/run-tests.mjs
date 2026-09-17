@@ -122,7 +122,12 @@ section('基础流程（ASCII 路径）');
 
   run(['index', '--root', root]);
   r = run(['inject', '--root', root]);
-  check('inject 只含 active（被取代的不出现）', !r.out.includes(idA) && r.out.includes(idB), flat(r.out));
+  // 注入正文里只有结论（id 不占预算，它随 source.entries 走结构化通道）
+  check('inject 只含 active（被取代的不出现）', r.out.includes('结论二') && !r.out.includes('结论一'), flat(r.out));
+  check('inject 正文不写 id（省预算）', !r.out.includes('<!--') && !r.out.includes(idB), flat(r.out));
+  check('inject 与 validate 用同一套渲染（字节数才对得上）', r.out.includes('dsh-memory 记录的项目长期记忆'), flat(r.out).slice(0, 80));
+  const payable = JSON.parse(run(['inject', '--root', root, '--json']).out);
+  check('--json 的 text 与 CLI 输出同源', payable.text.includes('结论二') && Buffer.byteLength(payable.text, 'utf8') === payable.bytes, `${payable.bytes}`);
 
   r = run(['validate', '--root', root]);
   const valOut = r.out + r.err;
