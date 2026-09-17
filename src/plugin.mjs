@@ -30,6 +30,8 @@ export const Config = z.object({
   maxBytes: z.number().step(1).min(256).default(3072),
   /** 关掉注入但保留工具（调试用）。 */
   enabled: z.boolean().default(true),
+  /** `verify_when` 提前几天提醒复核（0 = 只在已到期时提醒）。 */
+  dueWithin: z.number().step(1).min(0).default(0),
 });
 
 /** 把 (config, cwd) 解析成一次可用的记忆库句柄。 */
@@ -80,6 +82,7 @@ export function apply(ctx, config = {}) {
         },
       }),
     logger: ctx.logger,
+    dueWithin: config.dueWithin ?? 0,
   });
 
   ctx.on('agent/pre-step', (input, next) => hook.handlePreStep(input, next));
@@ -220,4 +223,9 @@ export function apply(ctx, config = {}) {
       presentCall: (args) => ({ card: 'generic', title: `Remember: ${truncated(args.conclusion, 60)}`, kind: 'other', rawInput: args }),
     }),
   );
+
+  // 返回 hook：不是为了给 DSH 用（loader 不看返回值），而是留一个**不污染 ctx 的测试缝** ——
+  // 只算不做的 `planFor` 是排查"这轮为什么注入/为什么不注入"最直接的入口，
+  // 测试可以直接断言它的返回形状，而不是反推 pre-step 结果。
+  return hook;
 }

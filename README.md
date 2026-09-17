@@ -11,8 +11,9 @@ zero-dependency standalone CLI. It borrows the *spec / change / archive* discipl
 > [Gitee](https://gitee.com/xingluzhe/dsh-memory) is a read-only mirror —
 > please file issues and pull requests on GitHub.
 
-> Status: **M1–M3 done and verified inside a real DSH session** (differential injection, both tools,
-> the distillation nudge). See [Verification](#verification).
+> Status: **M1–M4 done**; M3/M4 (differential injection, both tools, the distillation nudge) were
+> verified inside a real DSH session, and the M5 improvements below are covered by 419 assertions
+> plus a real-machine preflight. See [Verification](#verification).
 
 ## Why
 
@@ -46,7 +47,10 @@ store ──┤
 Seven rules:
 
 - **The pushed part must be tiny.** Everything in the injected layer is paid for on every session, so the
-  journal and design docs stay out of it.
+  journal and design docs stay out of it. Measured on a real store (6 entries): **953 bytes** total, 68% of
+  it the entry lines themselves, ~300 bytes of framing — about **159 bytes per entry**, so the 3 KB default
+  budget holds ~19 entries. Entry ids are deliberately **not** written into the text (they ride along in the
+  message's structured `source.entries`); inlining them used to eat 34% of the budget.
 - **Only the delta is pushed.** Every entry carries a 12-char content hash; the plugin remembers the
   previous round's state and next round pushes only *added / updated / removed*. When nothing changed it
   injects **nothing at all**. (The upstream `dsh-agent-instructions` plugin has no diffing: any file
@@ -112,9 +116,10 @@ Seven rules:
 | Capability | Detail |
 | --- | --- |
 | **Differential injection** | First round injects every active entry (baseline); afterwards only *added / updated / removed*; **nothing at all** when unchanged |
-| `memory_search` | Search facts / decisions / inbox / archive / journal |
+| `memory_search` | Relevance-ranked search across facts / decisions / inbox / archive / journal / session index. Field weights (key/id > tags > conclusion > body), a whole-phrase bonus, and Chinese matched by **bigram** so a query like `沙箱禁管道` hits `沙箱禁止命名管道` without spaces. Each hit carries a score and a snippet from its best-matching line |
 | `memory_write` | Record a candidate into the inbox — **the model cannot touch the standing layer** |
 | Distillation nudge | Once a session has run a few steps and memory is already current, it reminds the model to record conclusions with `memory_write`; one nudge per session, and the nudge message carries **no state**, so it cannot corrupt the diff baseline |
+| Due-for-review reminder | `verify_when` is no longer a dead field: when an entry reaches its review date, the session is told once — "this conclusion may be stale, re-check it" — with the exact command to supersede or expire it. Prose values (`等换机器时`) never trigger it, so the reminder can always be resolved; it fires only on a step that injects nothing else, and it carries **no state** either |
 
 The plugin never spawns the CLI: the DSH sandbox forbids named pipes (capturing a child's output fails
 with EPERM), and there is no need — it imports the same store module directly (`bin/mem.mjs` only runs
@@ -143,9 +148,14 @@ mem show <id>
 mem validate [--fix]   # format / ids / bidirectional links / cycles / same-key conflicts / index / budget
 mem index              # rebuild index.md
 mem inject [--json] [--budget 3072]   # render what should be injected; --json adds per-entry hashes
-mem recall <keyword>
+mem recall <keywords> [--where all|facts|decisions|inbox|archive|journal|sessions|index] [--limit N] [--json]
+                       # relevance-ranked: Chinese is matched by bigram, no spaces needed
+mem due [--within N] [--json]   # entries whose verify_when is due (--within N also warns N days ahead)
 mem journal add "one line"
 ```
+
+`verify_when` takes either a date (`2027-03-01`) or a relative phrase measured from the entry's own
+date (`3个月后`, `2周后`, `立即`); anything else is treated as prose and simply never auto-fires.
 
 ## Verification
 
@@ -163,15 +173,17 @@ Checked item by item inside a real DSH session:
 ## Development
 
 ```bash
-npm test        # 173 assertions
+npm test        # 419 assertions, zero dependencies
 ```
 
 | Suite | Assertions | Covers |
 | --- | --- | --- |
-| `test/run-tests.mjs` | 62 | CLI end-to-end (incl. a non-ASCII path regression) |
-| `test/planner-tests.mjs` | 36 | the diff algorithm (pure logic) |
-| `test/hook-tests.mjs` | 39 | plugin wiring (fake agent / decision) |
-| `test/plugin-tests.mjs` | 36 | plugin integration (stubbed DSH modules, real `apply()`) |
+| `test/run-tests.mjs` | 109 | CLI end-to-end (incl. a non-ASCII path regression, ranked recall, `mem due`) |
+| `test/planner-tests.mjs` | 43 | the diff algorithm (pure logic) |
+| `test/search-tests.mjs` | 51 | tokenizing / scoring / snippet selection (pure logic) |
+| `test/due-tests.mjs` | 93 | `verify_when` parsing (dates, relative phrases, prose) and due collection (pure logic) |
+| `test/hook-tests.mjs` | 63 | plugin wiring (fake agent / decision): diff injection, nudge, due reminder |
+| `test/plugin-tests.mjs` | 60 | plugin integration (stubbed DSH modules, real `apply()` + both tools) |
 
 `test/plugin-tests.mjs` replaces the four `@deepseek-ai/*` packages with the stubs in `test/stubs/`
 (via `test/stub-loader.mjs`) and **actually `apply()`s the plugin**, so its behaviour is verifiable
@@ -185,7 +197,13 @@ Regression tests baked in from real bugs:
   `recursive`) — `unlinkSync` must be used instead;
 - The DSH sandbox forbids named pipes, so `spawnSync` with the default `stdio: 'pipe'` hits EPERM —
   tests must redirect child output to a **file**;
-- An entry written by the tool must carry the **session workspace** scope, not the harness process cwd.
+- An entry written by the tool must carry the **session workspace** scope, not the harness process cwd;
+- `new URL(import.meta.url).pathname` **percent-encodes a non-ASCII user name**
+  (`C:\Users\李鹏飞` → `C:\Users\%E6%9D%8E%E9%B9%8F%E9%A3%9E`), which turns "write into my plugin folder"
+  into "write into a path that does not exist" — always use `fileURLToPath`;
+- A field added to *some* early-return paths of an internal planner function (`due`) was destructured
+  into `undefined` and threw on every step, which the outer `try/catch` silently reported as
+  "failed to load memory" — hence the defensive read and the zero-warning assertion.
 
 ## Roadmap
 
@@ -193,7 +211,11 @@ Regression tests baked in from real bugs:
 - **M2 ✅** explicit short ids, semantic keys and "one key one truth", `inject --json` diff payload,
   `validate --fix`, `mem set`
 - **M3 ✅** DSH plugin: differential injection + both tools + the distillation nudge (verified live)
-- **M4** publish (GitHub primary / Gitee mirror)
+- **M4 ✅** published (GitHub primary / Gitee mirror)
+- **M5 ✅** the memory got *usable at scale*: index-style injection (id-free text, ~159 bytes per
+  entry), relevance-ranked search with Chinese bigrams, and `verify_when` turned into a real
+  due-for-review reminder
+- **Next** official distribution (plugin market) and a memory tab in the DSH sidebar
 
 ## License
 

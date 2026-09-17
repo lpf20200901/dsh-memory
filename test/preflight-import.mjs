@@ -37,13 +37,17 @@ try {
   // 所以要看它有没有把我们的字段解析进去，而不是看它像不像普通对象。
   const configKeys = mod.Config?.dict ? Object.keys(mod.Config.dict) : Object.keys(mod.Config ?? {});
   check(
-    '真实 schemastery 解析出了 root/maxBytes/enabled',
-    ['root', 'maxBytes', 'enabled'].every((k) => configKeys.includes(k)),
+    '真实 schemastery 解析出了 root/maxBytes/enabled/dueWithin',
+    ['root', 'maxBytes', 'enabled', 'dueWithin'].every((k) => configKeys.includes(k)),
     configKeys.join(','),
   );
   try {
     const normalized = typeof mod.Config === 'function' ? mod.Config({}) : null;
-    check('Config({}) 能取到默认值 maxBytes=3072', !normalized || normalized.maxBytes === 3072, JSON.stringify(normalized));
+    check(
+      'Config({}) 能取到默认值 maxBytes=3072 / dueWithin=0',
+      !normalized || (normalized.maxBytes === 3072 && normalized.dueWithin === 0),
+      JSON.stringify(normalized),
+    );
   } catch (error) {
     check('Config({}) 不应抛异常', false, `${error?.name}: ${error?.message}`);
   }

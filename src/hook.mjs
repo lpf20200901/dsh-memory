@@ -10,6 +10,7 @@
  * 我们照这个合约做，但内容换成**差分**的（见 planner.mjs）。
  */
 
+import { collectDue, renderDue } from './due.mjs';
 import { MEMORY_SOURCE_KIND, planInjection, previousStateFrom, sourceEntries } from './planner.mjs';
 
 /** 判断一条消息是不是我们自己发的。 */
@@ -67,25 +68,57 @@ export function collectVisibleMessages(agent, messages, decision) {
   return out;
 }
 
-export function createMemoryHook({ loadPayload, createMessage, logger = console, nudgeAfterTurns = 4 }) {
+export function createMemoryHook({
+  loadPayload,
+  createMessage,
+  logger = console,
+  nudgeAfterTurns = 4,
+  today = () => new Date().toISOString().slice(0, 10),
+  dueWithin = 0,
+}) {
   if (typeof loadPayload !== 'function') throw new Error('createMemoryHook: loadPayload 必填');
   if (typeof createMessage !== 'function') throw new Error('createMemoryHook: createMessage 必填');
 
   /** 每个会话只提醒一次蒸馏。 */
   const nudged = new WeakSet();
 
-  /** 算这一轮要不要注入、注入什么。返回 null 表示"不需要注入任何东西"。 */
+  /** 每个会话只提醒一次"到期复核"（会话恢复 / 回放时靠消息里的 form='due' 兜底）。 */
+  const dueNotified = new WeakSet();
+
+  /**
+   * 本会话是否已经发过到期提醒。
+   * 两条通道都要查：WeakSet 管同进程内的重复，`collectVisibleMessages` 管会话恢复之后
+   * 从历史消息里认出"这条提醒我上辈子发过"。
+   */
+  function alreadyNotifiedDue(agent, messages, decision) {
+    if (agent?.session && dueNotified.has(agent.session)) return true;
+    return collectVisibleMessages(agent, messages, decision).some((message) => message?.source?.form === 'due');
+  }
+
+  /**
+   * 算这一轮要不要注入、注入什么。
+   * @returns {{plan: object|null, desired: object|null, entries: Array, due: Array}}
+   *   返回 `entries` / `due` 是为了让 handlePreStep 在**零注入**的那一轮也能判断到期复核
+   *   （那时没有任何消息要发，但可能有记忆该提醒了）。
+   */
   async function planFor(agent, messages, decision) {
     const cwd = agent?.session?.header?.cwd ?? process.cwd();
     const payload = await loadPayload(cwd);
     if (!payload || !Array.isArray(payload.entries) || payload.entries.length === 0) {
       // 记忆库为空或不可用 —— 不但不该注入，还应该把之前排队的清掉
-      return { plan: null, desired: null };
+      // ⚠️ 每条 return 都必须带全 {plan, desired, entries, due} 四个字段：
+      // 少一个就会让 handlePreStep 的取值变成 undefined（曾表现为"没建 memory/ 的工作区
+      // 每一步都打一条加载失败告警"，因为 TypeError 被外层 catch 当成加载失败吃掉了）。
+      return { plan: null, desired: null, entries: [], due: [] };
     }
+    // 到期复核项：即使这一轮"记忆没变化、零注入"，也可能有该复核的记忆要提醒。
+    // 只认**真算出了日期**的条目：`verify_when` 写成人话（"等换机器时"）的不算 ——
+    // 否则那条提醒会在每个会话里永远弹一次，而且用户怎么改都消不掉。
+    const due = collectDue(payload.entries, today(), { within: dueWithin }).filter((d) => !d.unparsed);
     const previous = previousStateFrom(collectVisibleMessages(agent, messages, decision));
     const plan = planInjection(payload.entries, previous);
-    if (plan.mode === 'none' || !plan.text) return { plan, desired: null };
-    return { plan, desired: createMessage(plan.text, sourceEntries(plan.state), plan.mode) };
+    if (plan.mode === 'none' || !plan.text) return { plan, desired: null, entries: payload.entries, due };
+    return { plan, desired: createMessage(plan.text, sourceEntries(plan.state), plan.mode), entries: payload.entries, due };
   }
 
   return {
@@ -101,13 +134,34 @@ export function createMemoryHook({ loadPayload, createMessage, logger = console,
       const decision = await next();
       let desired = null;
       let plan = null;
+      let due = [];
       try {
-        ({ plan, desired } = await planFor(agent, messages, decision));
+        // 防御式取值：planFor 的**每条** return 路径都必须带 `due`，但这里不赌它 ——
+        // 早退分支漏一个字段曾导致 `due` 被解构成 undefined、`due.length` 抛 TypeError，
+        // 被下面的 catch 吃掉后表现成"每一步都打一条加载失败告警"（噪音 + 跳过排队清理）。
+        const result = (await planFor(agent, messages, decision)) ?? {};
+        plan = result.plan ?? null;
+        desired = result.desired ?? null;
+        due = Array.isArray(result.due) ? result.due : [];
         // 记忆已是最新、但会话跑了不少轮 —— 给一次蒸馏提醒（每个会话只给一次）
         if (desired === null && Number.isFinite(nudgeAfterTurns) && step >= nudgeAfterTurns && agent?.session && !nudged.has(agent.session)) {
           nudged.add(agent.session);
           // 不带 entries：它不携带状态，不会影响下一轮的差分判断
           desired = createMessage(NUDGE_TEXT, null, 'nudge');
+        }
+        // 到期复核：**只在本来不注入任何记忆时**才提醒 —— 抢 baseline/delta 那条消息
+        // 会把"记忆变化"这件事挤掉，那才是更该让模型看到的东西。
+        // 一个会话只提醒一次：既不重复骚扰，也避免把注入预算花在同一句话上。
+        if (desired === null && due.length > 0 && !alreadyNotifiedDue(agent, messages, decision)) {
+          const text = renderDue(due);
+          // renderDue 对空列表返回 '' —— 绝不注入空消息
+          if (text) {
+            if (agent?.session) dueNotified.add(agent.session);
+            // ⚠️ 第二个参数（entries）**必须是 null**，第三个参数是 form：
+            // 提醒一旦携带 entries，就会被 previousStateFrom 当成"上一轮状态"、把差分基线清零，
+            // 下一轮又会全量重灌（这个坑 nudge 踩过，别再重演）。
+            desired = createMessage(text, null, 'due');
+          }
         }
       } catch (error) {
         // 记忆库坏了绝不能拖垮会话 —— 记一笔，然后放行

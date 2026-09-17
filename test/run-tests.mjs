@@ -371,6 +371,103 @@ section('recall：相关度排序 / 中文 bigram / 分层过滤');
   check('搜不到时不硬凑结果', /没有匹配/.test(none.out), flat(none.out));
 }
 
+/* --------------------------------------- M3：verify_when 到期复核（mem due） */
+section('M3：verify_when 到期复核与 mem due');
+{
+  const root = freshRoot('due');
+  run(['init', '--root', root, '--scope', 'workspace:x']);
+
+  // 空态：没有到期项不算失败（退出码 0），脚本可以直接串起来
+  let r = run(['due', '--root', root]);
+  check('没有条目时 due 不报错（退出码 0）', r.code === 0, `code=${r.code} ${flat(r.err)}`);
+  check('空态提示「没有到期的复核项」', /没有到期的复核项/.test(r.out), flat(r.out));
+  const empty = JSON.parse(run(['due', '--root', root, '--json']).out);
+  check('空态 --json 合法且 total=0', empty.total === 0 && Array.isArray(empty.due) && /^\d{4}-\d{2}-\d{2}$/.test(empty.today), flat(JSON.stringify(empty)));
+
+  run(['index', '--root', root]);
+  r = run(['validate', '--root', root]);
+  check('没有到期项时 validate 不报到期告警', !/复核期/.test(r.out + r.err), flat(r.out + r.err));
+
+  // 一条正常条目 + 一条已超期的（2000-01-01，怎么跑都过期）+ 一条未来的
+  run(['new', '--root', root, '--type', 'fact', '--id', 'plain', '--conclusion', '没写复核时机的条目', '--source', 's']);
+  run(['promote', '--root', root, 'plain']);
+  run(['new', '--root', root, '--type', 'fact', '--id', 'overdue', '--conclusion', '早就该复核的条目', '--source', 's']);
+  run(['promote', '--root', root, 'overdue']);
+  run(['new', '--root', root, '--type', 'fact', '--id', 'future', '--conclusion', '以后才需要复核的条目', '--source', 's']);
+  run(['promote', '--root', root, 'future']);
+
+  r = run(['set', '--root', root, 'overdue', '--verify-when', '2000-01-01']);
+  check('set --verify-when 成功', r.code === 0, r.err);
+  r = run(['set', '--root', root, 'future', '--verify-when', '2099-01-01']);
+  check('set 未来的 verify_when 成功', r.code === 0, r.err);
+
+  r = run(['due', '--root', root]);
+  check('due 列出已到期条目', r.code === 0 && r.out.includes('overdue'), flat(r.out));
+  check('due 不列未来的条目', !r.out.includes('future'), flat(r.out));
+  check('due 不列没写 verify_when 的条目', !r.out.includes('plain'), flat(r.out));
+  check('due 显示超期天数', /已超期 \d+ 天/.test(r.out), flat(r.out));
+  check('due 显示 verify_when 原值', /verify_when: 2000-01-01/.test(r.out), flat(r.out));
+  check('due 显示结论正文', /早就该复核的条目/.test(r.out), flat(r.out));
+
+  const j = JSON.parse(run(['due', '--root', root, '--json']).out);
+  check('due --json 是合法 JSON', j.total === 1 && j.due[0].id === 'overdue', flat(JSON.stringify(j)));
+  check('due --json 带 overdueDays / verifyWhen / due / line', typeof j.due[0].overdueDays === 'number' && j.due[0].verifyWhen === '2000-01-01' && j.due[0].due === '2000-01-01' && !!j.due[0].line, flat(JSON.stringify(j.due[0])));
+  check('due --json 的 overdueDays 是正数（已超期）', j.due[0].overdueDays > 0, String(j.due[0].overdueDays));
+
+  // --within 生效：36500 天足够把 2099 那条也圈进来
+  const wide = JSON.parse(run(['due', '--root', root, '--within', '36500', '--json']).out);
+  check('--within 生效（把未来的条目也算进来）', wide.total === 2 && wide.due.some((d) => d.id === 'future'), flat(JSON.stringify(wide.due.map((d) => d.id))));
+  check('--within 时未到期条目 overdueDays 为负', wide.due.find((d) => d.id === 'future').overdueDays < 0, String(wide.due.find((d) => d.id === 'future').overdueDays));
+  check('--within 只影响过滤、不改排序（超期的仍在最前）', wide.due[0].id === 'overdue', flat(JSON.stringify(wide.due.map((d) => d.id))));
+  const narrow = JSON.parse(run(['due', '--root', root, '--within', '1', '--json']).out);
+  check('--within 1 仍只看到已超期的那条', narrow.total === 1, flat(JSON.stringify(narrow.due.map((d) => d.id))));
+
+  // 相对写法：以**条目自己的 date** 为基准（条目就是今天建的，所以 3 个月后 ≈ today + 3 个月）
+  r = run(['set', '--root', root, 'future', '--verify-when', '3个月后']);
+  check('set 支持相对写法（3个月后）', r.code === 0, r.err);
+  const rel = JSON.parse(run(['due', '--root', root, '--within', '36500', '--json']).out);
+  const relFuture = rel.due.find((d) => d.id === 'future');
+  check('相对写法把原值带出来、同时给出算好的 due', relFuture.verifyWhen === '3个月后' && /^\d{4}-\d{2}-\d{2}$/.test(String(relFuture.due)), flat(JSON.stringify(relFuture)));
+  check('相对写法算出的 due 晚于今天（条目刚建）', relFuture.due > rel.today, `${relFuture.due} vs ${rel.today}`);
+
+  // validate：到期当**告警**报，绝不影响退出码
+  r = run(['validate', '--root', root]);
+  check('validate 报出到期告警', /1 条记忆到了 verify_when 复核期/.test(r.out + r.err), flat(r.out + r.err));
+  check('到期告警不影响 validate 退出码（仍是 0）', r.code === 0, `code=${r.code} ${flat(r.out + r.err)}`);
+  check('告警提示跑 mem due', /跑 mem due 看明细/.test(r.out + r.err), flat(r.out + r.err));
+
+  // 收尾：把到期条目标 expired 后，due 与告警都该干净
+  run(['set', '--root', root, 'overdue', '--status', 'expired']);
+  r = run(['due', '--root', root]);
+  check('expired 条目不再出现在 due 里', r.code === 0 && /没有到期的复核项/.test(r.out), flat(r.out));
+  r = run(['validate', '--root', root]);
+  check('处理完之后 validate 没有到期告警', !/复核期/.test(r.out + r.err), flat(r.out + r.err));
+}
+
+/* --------------------------------------- 注入载荷带上 date / verifyWhen */
+section('注入载荷：每条带 date 与 verifyWhen（只增不改）');
+{
+  const root = freshRoot('payload');
+  run(['init', '--root', root, '--scope', 'workspace:x']);
+  run(['new', '--root', root, '--type', 'fact', '--id', 'p1', '--conclusion', '带复核时机的条目', '--source', 's']);
+  run(['promote', '--root', root, 'p1']);
+  run(['set', '--root', root, 'p1', '--verify-when', '3个月后']);
+  run(['new', '--root', root, '--type', 'decision', '--id', 'p2', '--conclusion', '不带复核时机的条目', '--source', 's']);
+  run(['promote', '--root', root, 'p2']);
+  run(['index', '--root', root]);
+
+  const payload = JSON.parse(run(['inject', '--root', root, '--json']).out);
+  check('载荷仍是 2 条', payload.entries.length === 2, String(payload.entries.length));
+  check('每条都带 date 字段', payload.entries.every((e) => /^\d{4}-\d{2}-\d{2}$/.test(String(e.date))), flat(JSON.stringify(payload.entries.map((e) => e.date))));
+  check('每条都带 verifyWhen 键（没写的为 null）', payload.entries.every((e) => 'verifyWhen' in e), flat(JSON.stringify(payload.entries.map((e) => e.verifyWhen))));
+  check('写了 verify_when 的原样带出', payload.entries.find((e) => e.id === 'p1').verifyWhen === '3个月后', flat(JSON.stringify(payload.entries.find((e) => e.id === 'p1'))));
+  check('没写 verify_when 的是 null', payload.entries.find((e) => e.id === 'p2').verifyWhen === null, flat(JSON.stringify(payload.entries.find((e) => e.id === 'p2'))));
+  check('原有字段一个都没少（id/type/scope/key/tags/status/where/hash/line）',
+    payload.entries.every((e) => ['id', 'type', 'scope', 'key', 'tags', 'status', 'where', 'hash', 'line'].every((k) => k in e)),
+    flat(JSON.stringify(Object.keys(payload.entries[0]))));
+  check('hash 仍是 12 位（差分不受新字段影响）', payload.entries.every((e) => /^[0-9a-f]{12}$/.test(e.hash)), flat(JSON.stringify(payload.entries.map((e) => e.hash))));
+}
+
 /* ------------------------------------------------------------- 汇总 */
 rmrf(SANDBOX);
 console.log(`\n${pass} 通过 / ${fail} 失败`);

@@ -102,7 +102,7 @@ section('插件契约（导出形状）');
 {
   check('name 是 memory', name === 'memory', name);
   check('inject 声明了 tools 服务', Array.isArray(injectServices) && injectServices.includes('tools'), JSON.stringify(injectServices));
-  check('Config 声明了 root/maxBytes/enabled', !!Config.root && !!Config.maxBytes && !!Config.enabled, Object.keys(Config).join(','));
+  check('Config 声明了 root/maxBytes/enabled/dueWithin', ['root', 'maxBytes', 'enabled', 'dueWithin'].every((k) => !!Config[k]), Object.keys(Config).join(','));
 }
 
 /* ------------------------------------------------------------------ 接线 */
@@ -110,7 +110,8 @@ section('插件契约（导出形状）');
 section('apply() 接线：注册 pre-step 与两个工具');
 const ctx = fakeCtx();
 const cwdOfProject = path.join(SANDBOX, 'proj');
-apply(ctx, { root: ROOT, maxBytes: 3072, enabled: true });
+// apply 的返回值不是给 DSH 用的，而是留一个不污染 ctx 的测试缝（见 src/plugin.mjs 末尾注释）
+const plugin = apply(ctx, { root: ROOT, maxBytes: 3072, enabled: true });
 
 check('注册了 agent/pre-step', typeof ctx.handlers.get('agent/pre-step') === 'function');
 check('注册了 2 个工具', ctx.registered.length === 2, ctx.registered.map((t) => t.name).join(","));
@@ -158,6 +159,10 @@ const preStep = ctx.handlers.get('agent/pre-step');
   // 回归：id 只走 source.entries，不进正文（曾占掉 40% 注入字节）
   check('注入正文不含 id 注释', delta && !delta.content[0].text.includes('<!--'), delta?.content[0].text.slice(0, 120));
   check('baseline 正文也不含 id 注释', !baseline.content[0].text.includes('<!--'), baseline.content[0].text.slice(0, 120));
+
+  // 到期复核要用 payload 里的 date / verify_when —— 缺了它们，hook 就算不出"到点了"
+  check('injectPayload 每条都带 date 键', payload.entries.every((e) => 'date' in e), JSON.stringify(payload.entries.map((e) => e.date)));
+  check('injectPayload 每条都带 verifyWhen 键（没写则为 null）', payload.entries.every((e) => 'verifyWhen' in e && (e.verifyWhen === null || typeof e.verifyWhen === 'string')), JSON.stringify(payload.entries.map((e) => e.verifyWhen)));
 }
 
 /* ------------------------------------------------------------------ 工具 */
@@ -219,6 +224,84 @@ const toolAgent = fakeAgent(cwdOfProject, 'session-tool');
   check('无可渲染输出时不炸', Array.isArray(rendered) && typeof rendered[0].text === 'string', JSON.stringify(rendered));
 }
 
+/* ------------------------------------------------- 到期复核：真接线跑一遍 */
+
+section('到期复核：通过插件真实接线发出 form=due 的提醒');
+{
+  // 造一条"早已过期"的条目（verify_when 是过去日期），直接写进 facts/
+  const created = createEntry(L, { type: 'fact', id: 'stale-fact', conclusion: '该复核的老结论', source: 's2' });
+  fs.writeFileSync(path.join(L.facts, 'stale-fact.md'), fs.readFileSync(created.file, 'utf8'), 'utf8');
+  fs.unlinkSync(created.file);
+  const stalePath = path.join(L.facts, 'stale-fact.md');
+  fs.writeFileSync(stalePath, fs.readFileSync(stalePath, 'utf8').replace('verify_when: null', 'verify_when: 2000-01-01'), 'utf8');
+
+  const dueCtx = fakeCtx();
+  apply(dueCtx, { root: ROOT, maxBytes: 3072 });
+  const agent = fakeAgent(cwdOfProject, 'session-due');
+
+  // 传一份"已含全部当前记忆状态"的历史：这样 plan 是 none，走的正是到期提醒该出场的那条路
+  const state = injectPayload(L, 3072).entries.map((e) => ({ id: e.id, hash: e.hash }));
+  const seen = { id: 'seen', source: { kind: MEMORY_SOURCE_KIND, entries: state }, content: [{ type: 'text', text: '之前注入过' }] };
+  const claimed = [{ id: 'u2', source: { kind: 'user' }, content: [{ type: 'text', text: '继续' }] }, seen];
+  const d = { kind: 'ok', messages: [...claimed] };
+
+  const out = await dueCtx.handlers.get('agent/pre-step')({ agent, messages: claimed, step: 2 }, async () => d);
+  const dueMsg = out.messages.find((m) => m.source?.form === 'due');
+  check('插件接线能发出到期提醒', !!dueMsg, JSON.stringify(out.messages.map((m) => m.source?.form)));
+  check('提醒通过真实 createUserMessage 构造', !!dueMsg && dueMsg.role === 'user' && Array.isArray(dueMsg.content), JSON.stringify(dueMsg?.content));
+  check('提醒的 source.entries 是 undefined（不污染差分基线）', dueMsg && dueMsg.source.entries === undefined, JSON.stringify(dueMsg?.source));
+  check('提醒文案含该复核的条目', !!dueMsg && /该复核的老结论/.test(dueMsg.content[0].text), dueMsg?.content[0].text.slice(0, 160));
+  check('这一轮不重复注入记忆（desired 本来就是 null）', out.messages.filter((m) => m.source?.kind === MEMORY_SOURCE_KIND).length === 2, String(out.messages.length));
+
+  // 同一个会话再跑一步 → 不再提醒
+  const nextMessages = [...out.messages];
+  const d2 = { kind: 'ok', messages: [...nextMessages] };
+  const out2 = await dueCtx.handlers.get('agent/pre-step')({ agent, messages: nextMessages, step: 3 }, async () => d2);
+  check('同一会话不重复提醒（真实接线）', out2 === d2, String(out2.messages.length));
+  check('到期提醒没带来告警噪音', dueCtx.warnings.length === 0, JSON.stringify(dueCtx.warnings));
+
+  // verify_when 写成**人话** → 一律不提醒（否则每个会话都弹一次、永远消不掉）
+  fs.writeFileSync(stalePath, fs.readFileSync(stalePath, 'utf8').replace('verify_when: 2000-01-01', 'verify_when: 等换机器时'), 'utf8');
+  const proseCtx = fakeCtx();
+  apply(proseCtx, { root: ROOT, maxBytes: 3072 });
+  const proseAgent = fakeAgent(cwdOfProject, 'session-prose');
+  const state2 = injectPayload(L, 3072).entries.map((e) => ({ id: e.id, hash: e.hash }));
+  const seen2 = { id: 'seen2', source: { kind: MEMORY_SOURCE_KIND, entries: state2 }, content: [{ type: 'text', text: '之前注入过' }] };
+  const claimed2 = [{ id: 'u3', source: { kind: 'user' }, content: [{ type: 'text', text: '继续' }] }, seen2];
+  const d3 = { kind: 'ok', messages: [...claimed2] };
+  const out3 = await proseCtx.handlers.get('agent/pre-step')({ agent: proseAgent, messages: claimed2, step: 2 }, async () => d3);
+  check('verify_when 是人话时不提醒（真实接线）', out3 === d3, JSON.stringify(out3.messages.map((m) => m.source?.form)));
+
+  // dueWithin 从插件 Config **真的透传**到 hook：条目 10 天后才到复核期，
+  // 默认（0）不提醒，"提前 30 天"要提醒。只看 schema 有没有字段是不够的 —— 得走真接线。
+  const soonRoot = path.join(SANDBOX, 'due-within', 'memory');
+  ensureLayout(soonRoot);
+  const soonL = ensureLayout(soonRoot, { create: false });
+  const inTenDays = new Date(Date.now() + 10 * 86400000).toISOString().slice(0, 10);
+  const soonCreated = createEntry(soonL, { type: 'fact', id: 'soon-fact', conclusion: '十天后该复核的事', verifyWhen: inTenDays, source: 's1' });
+  fs.writeFileSync(path.join(soonL.facts, 'soon-fact.md'), fs.readFileSync(soonCreated.file, 'utf8'), 'utf8');
+  fs.unlinkSync(soonCreated.file);
+
+  const soonCwd = path.join(SANDBOX, 'due-within');
+  const soonState = injectPayload(soonL, 3072).entries.map((e) => ({ id: e.id, hash: e.hash }));
+  const seenSoon = { id: 'seen-soon', source: { kind: MEMORY_SOURCE_KIND, entries: soonState }, content: [{ type: 'text', text: '之前注入过' }] };
+  const claimedSoon = [{ id: 'u-soon', source: { kind: 'user' }, content: [{ type: 'text', text: '继续' }] }, seenSoon];
+  const dSoon = { kind: 'ok', messages: [...claimedSoon] };
+
+  const offCtxSoon = fakeCtx();
+  apply(offCtxSoon, { root: soonRoot });
+  const outSoonOff = await offCtxSoon.handlers.get('agent/pre-step')({ agent: fakeAgent(soonCwd, 'session-soon-off'), messages: claimedSoon, step: 2 }, async () => dSoon);
+  check('dueWithin 默认 0：还没到期的条目不提醒', outSoonOff === dSoon, JSON.stringify(outSoonOff.messages.map((m) => m.source?.form)));
+
+  const onCtxSoon = fakeCtx();
+  apply(onCtxSoon, { root: soonRoot, dueWithin: 30 });
+  const outSoonOn = await onCtxSoon.handlers.get('agent/pre-step')({ agent: fakeAgent(soonCwd, 'session-soon-on'), messages: claimedSoon, step: 2 }, async () => dSoon);
+  const dueSoon = outSoonOn.messages.find((m) => m.source?.form === 'due');
+  check('dueWithin=30：还没到期但快了 → 提醒（Config 真的透传到了 hook）', !!dueSoon, JSON.stringify(outSoonOn.messages.map((m) => m.source?.form)));
+  check('到期提醒里带上 verify_when 原值', !!dueSoon && dueSoon.content[0].text.includes(inTenDays), dueSoon?.content[0].text.slice(0, 120));
+  check('dueWithin 生效时也不带 entries（不污染差分基线）', !!dueSoon && dueSoon.source.entries === undefined, JSON.stringify(dueSoon?.source));
+}
+
 /* ------------------------------------------------------------ 配置与容错 */
 
 section('配置与容错');
@@ -232,14 +315,27 @@ section('配置与容错');
   check('enabled:false 时不注入', out === d, String(out.messages.length));
   check('enabled:false 时工具仍注册', off.registered.length === 2);
 
-  // root 指向不存在的目录 → 不注入、不抛异常
+  // root 指向不存在的目录 → 不注入、不抛异常、**零告警噪音**
   const empty = fakeCtx();
-  apply(empty, { root: path.join(SANDBOX, 'nope', 'memory') });
+  const emptyHook = apply(empty, { root: path.join(SANDBOX, 'nope', 'memory') });
   const agent2 = fakeAgent(path.join(SANDBOX, 'nope'), 'session-nope');
   const d2 = { kind: 'ok', messages: [{ id: 'u', source: { kind: 'user' }, content: [{ type: 'text', text: 'x' }] }] };
   const out2 = await empty.handlers.get('agent/pre-step')({ agent: agent2, messages: [], step: 2 }, async () => d2);
   check('记忆库不存在时不注入也不抛错', out2 === d2);
-  check('记忆库不存在时没有告警噪音', empty.warnings.length <= 1, JSON.stringify(empty.warnings));
+  // 连续跑两步：以前 due 字段漏在早退分支上时，每一步都会抛 TypeError 被 catch 成"加载失败"，
+  // 于是这里会看到 2 条告警（`<= 1` 的旧阈值恰好放过了它）。现在必须**一条都没有**。
+  const out2b = await empty.handlers.get('agent/pre-step')({ agent: agent2, messages: [], step: 3 }, async () => d2);
+  check('记忆库不存在时第二步也不注入', out2b === d2, String(out2b.messages.length));
+  check('记忆库不存在时连续两步零告警（早退分支字段齐全）', empty.warnings.length === 0, JSON.stringify(empty.warnings));
+
+  // 直接钉住 planFor 的返回形状：任何返回路径上 due 都必须是数组。
+  // （曾经早退分支漏了 due → 解构成 undefined → due.length 抛 TypeError 被 catch 成"加载失败"。）
+  const planned = await emptyHook.planFor(agent2, [], d2);
+  check('planFor 早退分支也返回 due 数组', Array.isArray(planned.due) && planned.due.length === 0, JSON.stringify(planned));
+  check('planFor 早退分支的 plan/desired 为 null', planned.plan === null && planned.desired === null, JSON.stringify(planned).slice(0, 160));
+  check('planFor 早退分支也返回 entries 数组', Array.isArray(planned.entries), JSON.stringify(planned).slice(0, 160));
+  const plannedOk = await plugin.planFor(fakeAgent(cwdOfProject, 'session-plan'), [], { kind: 'ok', messages: [] });
+  check('记忆库正常时 planFor 也返回 due 数组', Array.isArray(plannedOk.due), JSON.stringify(plannedOk).slice(0, 160));
 
   // 全新工作区：目录还不存在 —— memory_write 应该**按需创建**，而不是抛 ENOENT（真机预检抓到的）
   const freshRoot = path.join(SANDBOX, 'fresh', 'memory');

@@ -42,6 +42,9 @@ AI 编码助手有两个反复出现的毛病：
 七条纪律：
 
 - **推送的东西必须极小**：注入层里的内容每次会话都要花 token。所以流水、设计文档都不进注入层。
+  实测一个 6 条目的真实记忆库：注入文本 **953 字节**，其中 68% 是条目行本身、约 300 字节是框架说明，
+  **平均 159 字节/条** → 3 KB 默认预算装得下约 19 条。条目 id **故意不写进正文**（它随消息的
+  结构化 `source.entries` 一起走），因为把 id 内联进正文曾吃掉 **34%** 的预算。
 - **只推变化的部分**：每条条目带 12 位内容 hash，插件记住上一轮的状态，下一轮**只推新增/已更新/已失效**；
   **完全没变化时一个字都不注入**。（上游 `dsh-agent-instructions` 没有差分：文件一变就整篇重注入，
   实测一个会话里改 15 次某个 8.5 KB 的文件 ≈ 白烧 58k tokens。）
@@ -101,9 +104,10 @@ AI 编码助手有两个反复出现的毛病：
 | 能力 | 说明 |
 | --- | --- |
 | **差分注入** | 首次注入全部 active 条目（baseline）；之后每轮只推「新增 / 已更新 / 已失效」；无变化时零注入 |
-| `memory_search` | 检索 facts / decisions / inbox / archive / journal |
+| `memory_search` | **按相关度排序**的检索，覆盖 facts / decisions / inbox / archive / journal / 会话索引。字段有权重（key/id > tags > 结论 > 正文）、整串短语有加成；中文按 **bigram** 匹配，所以 `沙箱禁管道` 能命中 `沙箱禁止命名管道`，不用手动加空格。每条结果带 score 与"命中最多的那一行"的片段 |
 | `memory_write` | 把候选条目写进 inbox —— **模型不允许直接改事实层** |
 | 蒸馏提醒 | 会话跑过若干轮而记忆已是最新时，提醒模型把本次结论落到 inbox；每会话只提醒一次，且提醒消息**不带状态**，不污染差分基线 |
+| 到期复核提醒 | `verify_when` 不再是死字段：条目到了当初约定的复核期，会话里会**提醒一次**"这条结论可能过时了，请复核"，并给出该用哪条命令取代/标过期。写成**人话**的值（`等换机器时`）永远不会触发它（否则每个会话都弹一次、怎么改都消不掉）；只在"本轮本来不注入任何记忆"时才提醒，同样**不带状态** |
 
 为什么插件**不去 spawn CLI**：DSH 沙箱禁止命名管道，捕获子进程输出会 EPERM；而且没必要 ——
 插件直接 `import` 同一份 store 逻辑（`bin/mem.mjs` 只在被直接执行时才跑 CLI）。
@@ -131,9 +135,14 @@ mem show <id>
 mem validate [--fix]       # 格式/id/双向链接/环/同 key 冲突/索引/注入预算
 mem index                  # 重建 index.md
 mem inject [--json] [--budget 3072]   # 渲染应注入内容；--json 出带 hash 的差分载荷
-mem recall <关键词>
+mem recall <关键词> [--where all|facts|decisions|inbox|archive|journal|sessions|index] [--limit N] [--json]
+                           # 按相关度排序；中文按 bigram 匹配，不用手动加空格
+mem due [--within N] [--json]   # 到了 verify_when 复核期的条目（--within N 提前 N 天也算）
 mem journal add "流水一行"
 ```
+
+`verify_when` 可以写日期（`2027-03-01`），也可以写**相对条目自身日期**的说法
+（`3个月后` / `2周后` / `立即`）；其它写法按"人话"处理，不会被自动提醒。
 
 ## 验证（实机）
 
@@ -151,15 +160,17 @@ mem journal add "流水一行"
 ## 开发
 
 ```bash
-npm test        # 173 个断言
+npm test        # 419 个断言，零依赖
 ```
 
 | 套件 | 断言 | 覆盖 |
 | --- | --- | --- |
-| `test/run-tests.mjs` | 62 | CLI 端到端（含非 ASCII 路径回归） |
-| `test/planner-tests.mjs` | 36 | 差分算法（纯逻辑） |
-| `test/hook-tests.mjs` | 39 | 插件接线（假 agent / decision） |
-| `test/plugin-tests.mjs` | 36 | 插件集成（桩 DSH 模块，真 apply） |
+| `test/run-tests.mjs` | 109 | CLI 端到端（含非 ASCII 路径回归、相关度检索、`mem due`） |
+| `test/planner-tests.mjs` | 43 | 差分算法（纯逻辑） |
+| `test/search-tests.mjs` | 51 | 分词 / 打分 / 片段选择（纯逻辑） |
+| `test/due-tests.mjs` | 93 | `verify_when` 解析（日期、相对说法、人话）与到期收集（纯逻辑） |
+| `test/hook-tests.mjs` | 63 | 插件接线（假 agent / decision）：差分注入、蒸馏提醒、到期提醒 |
+| `test/plugin-tests.mjs` | 60 | 插件集成（桩 DSH 模块，真 apply + 两个工具） |
 
 `test/plugin-tests.mjs` 用 `test/stubs/` 下的桩模块替换 4 个 `@deepseek-ai/*` 包，
 通过 `test/stub-loader.mjs` **真正 `apply()` 这个插件并驱动它**，所以即使没有 DSH 也能验证插件行为。
@@ -171,14 +182,22 @@ npm test        # 173 个断言
 - 路径含**非 ASCII** 字符时，Node 的 `fs.rmSync` 会**静默失败**（配 `recursive` 时甚至崩进程），
   必须用 `unlinkSync`；
 - DSH 沙箱禁止命名管道，`spawnSync` 默认的 `stdio:'pipe'` 会 EPERM，测试要把输出重定向到**文件**；
-- 工具写出的条目 scope 必须跟随**会话工作区**，不能落到 harness 进程的 cwd。
+- 工具写出的条目 scope 必须跟随**会话工作区**，不能落到 harness 进程的 cwd；
+- `new URL(import.meta.url).pathname` 会把**非 ASCII 用户名百分号编码**
+  （`C:\Users\李鹏飞` → `C:\Users\%E6%9D%8E%E9%B9%8F%E9%A3%9E`），"往插件目录里写"就变成
+  "往一个根本不存在的路径里写" —— 一律用 `fileURLToPath`；
+- 内部函数只给**部分** return 路径补字段（`due`），解构出来就是 `undefined`，每一步都抛错、
+  又被外层 try/catch 包装成"加载记忆失败" —— 于是有了防御式取值 + "零告警"断言。
 
 ## 路线图
 
 - **M1 ✅** CLI + 结构化条目 + validate + 索引/注入预算
 - **M2 ✅** 显式短 id、语义键与「一个 key 一个真相」、`inject --json` 差分载荷、`validate --fix`、`mem set`
 - **M3 ✅** DSH 插件：差分注入 + 两个工具 + 蒸馏提醒（已实机验证）
-- **M4** 发布（GitHub 主 / Gitee 镜像）
+- **M4 ✅** 发布（GitHub 主 / Gitee 镜像）
+- **M5 ✅** 让记忆"规模上真的可用"：注入改索引式（正文不写 id，平均约 159 字节/条）、
+  按相关度排序的检索（中文 bigram）、`verify_when` 落地成**到期复核提醒**
+- **下一步** 官方分发渠道（插件市场）+ DSH 侧边栏里的"记忆"页签
 
 ## 许可
 

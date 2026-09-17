@@ -18,6 +18,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 import { renderBaseline } from '../src/planner.mjs';
+import { collectDue, duePhrase } from '../src/due.mjs';
 import { findMatches, rankDocs } from '../src/search.mjs';
 
 const VERSION = '0.1.0';
@@ -637,6 +638,10 @@ function injectPayload(L, budget) {
     where: e.where,
     hash: entryHash(e),
     line: firstLine(e.body),
+    // 下面两个字段是给"到期提醒"用的（src/due.mjs）：日期作相对写法的基准、
+    // verify_when 判断是否到复核期。只增不改 —— 差分只认 id + hash。
+    date: e.data.date,
+    verifyWhen: e.data.verify_when ?? null,
   }));
   const text = renderInject(L);
   const bytes = Buffer.byteLength(text, 'utf8');
@@ -747,6 +752,44 @@ function cmdRecall(opts) {
     console.log(`    ${highlight(h.snippet, h.matched)}`);
   }
   console.log(dim(`\n命中 ${hits.length} 条（按相关度排序；--json 可机器读）`));
+}
+
+/* ---------------------------------------------------------------- due */
+
+/** 把 active 条目摊成 due.mjs 要的形状（verify_when / date 都来自 frontmatter）。 */
+function dueInput(L) {
+  return activeEntries(L).map((e) => ({ id: e.id, line: firstLine(e.body), date: e.data.date, verifyWhen: e.data.verify_when ?? null }));
+}
+
+/**
+ * 列出到了 `verify_when` 复核期的条目。
+ *
+ * 为什么要有它：`verify_when` 如果只能写不能读，就只是个装饰性的字段 ——
+ * 记忆的真正问题是"当初记的时候说好了要回头看，然后就再也没看过"。
+ */
+function cmdDue(opts) {
+  const root = resolveRoot(opts.root);
+  const L = ensureLayout(root, { create: false });
+  const day = today();
+  const within = opts.within ? Number(opts.within) : 0;
+  const list = collectDue(dueInput(L), day, { within });
+
+  if (opts.json) {
+    console.log(JSON.stringify({ today: day, within, total: list.length, due: list }, null, 2));
+    return;
+  }
+  if (!list.length) {
+    // 没有到期项是**正常状态**，不是失败：退出码保持 0，方便脚本直接串起来
+    console.log(dim('没有到期的复核项'));
+    return;
+  }
+  for (const d of list) {
+    // 最超期的排最前面（collectDue 已排好），颜色沿用 cmdList 那套：黄=要注意，青=id
+    console.log(`${c(33, duePhrase(d.overdueDays).padEnd(14))} ${c(36, String(d.id).padEnd(30))} ${dim(`verify_when: ${d.verifyWhen}${d.due ? ` → ${d.due}` : ''}`)}`);
+    console.log(`    ${d.line}`);
+  }
+  console.log(dim(`\n共 ${list.length} 条到期（今天 ${day}，within ${within} 天；--json 可机器读）`));
+  console.log(dim('  不再成立的：mem supersede <旧id> <新id>；仍然成立的：mem set <id> --verify-when "…"'));
 }
 
 /* ------------------------------------------------------------- validate */
@@ -882,6 +925,11 @@ function cmdValidate(opts) {
   const budget = cfg?.injectBudget ?? 3072;
   if (bytes > budget) problems.push(`注入体积超预算：${bytes} / ${budget} 字节（超 ${bytes - budget}）`);
 
+  // 到期复核项：**告警**不是问题 —— "有条目该复核了"是记忆库正常运转的表现，
+  // 不是格式错误，所以它绝不影响退出码（CI 里 validate 仍应通过）。
+  const due = collectDue(dueInput(L), today(), { within: 0 });
+  if (due.length) warnings.push(`${due.length} 条记忆到了 verify_when 复核期（跑 mem due 看明细）`);
+
   console.log(`\n检查 ${entries.length} 个条目（${path.relative(process.cwd(), root) || '.'}）`);
   if (!problems.length && !warnings.length) {
     ok('全部通过');
@@ -946,6 +994,7 @@ if (isMain) {
     case 'inject': cmdInject(opts); break;
     case 'journal': cmdJournal(opts); break;
     case 'recall': cmdRecall(opts); break;
+    case 'due': cmdDue(opts); break;
     case 'version': case '--version': console.log(VERSION); break;
     case 'help': case '--help': case undefined: usage(); break;
     default: fail(`未知命令：${cmd}\n跑 mem help 看用法`);
@@ -997,7 +1046,9 @@ function usage() {
                           同 key 已有 active 时必须显式 --supersedes
   supersede <旧id> <新id>                标记取代 + 归档 + 双向链接
   set <id> [--key k] [--tags a,b] [--scope s] [--status …] [--conclusion "…"]
-                          修改已有条目（补 key、改措辞、标 expired）
+      [--verify-when "…"]  修改已有条目（补 key、改措辞、标 expired）
+                           · --verify-when：复核时机。写 '2026-03-01' 或相对条目日期的
+                             '3个月后' / '2周后'（相对写法取条目自己的 date 为基准）
   validate [--fix]        校验（格式 / id / 双向链接 / 环 / 同 key 冲突 / 索引 / 注入预算）
                           --fix 只修机械问题：归档漏归档的 superseded、重建 index
   index                   重建 index.md
@@ -1007,6 +1058,9 @@ function usage() {
   recall <关键词> [--where <层>] [--limit N] [--json]
                            相关度排序检索；中文自动切 bigram，结果带命中片段
                            --where：all（默认）| facts | decisions | inbox | archive | journal | sessions | index
+  due [--within N] [--json]
+                           列出到了 verify_when 复核期的 active 条目（默认只看已到期）
+                           --within N 提前 N 天提醒；没有到期项时不算失败（退出码 0）
 
 根目录解析：--root > $DSH_MEMORY_ROOT > <cwd>/memory`);
 }

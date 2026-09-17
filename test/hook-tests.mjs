@@ -7,6 +7,7 @@
  */
 
 import { createMemoryHook, isMemoryMessage, sameMemoryPayload } from '../src/hook.mjs';
+import { renderDue } from '../src/due.mjs';
 import { MEMORY_SOURCE_KIND } from '../src/planner.mjs';
 
 let pass = 0;
@@ -68,13 +69,16 @@ function fakeAgent(cwd = 'D:\\proj') {
 const entry = (id, hash, extra = {}) => ({ id, hash, type: 'fact', key: null, line: `结论 ${id}`, ...extra });
 
 /** 造一个 hook；payload（条目集合）可以在测试中途改。 */
-function makeHook(entriesRef, { logger = { warn() {} }, nudgeAfterTurns = 99 } = {}) {
+function makeHook(entriesRef, { logger = { warn() {} }, nudgeAfterTurns = 99, today, dueWithin } = {}) {
   return createMemoryHook({
     loadPayload: async () => ({ entries: entriesRef.current, budget: 3072 }),
     createMessage: fakeCreateMessage,
     logger,
     // 默认把蒸馏提醒关掉（设很大），免得干扰别的用例；提醒本身有专门的测试段
     nudgeAfterTurns,
+    // 到期判断也注入"今天"，否则测试结果会随运行日期漂移
+    ...(today ? { today } : {}),
+    ...(dueWithin === undefined ? {} : { dueWithin }),
   });
 }
 
@@ -214,6 +218,139 @@ section('会话恢复 / 回放：从会话表面恢复状态');
   const d2 = { kind: 'ok', messages: [{ id: 'u', source: { kind: 'user' }, content: [{ type: 'text', text: 'x' }] }] };
   const out2 = await hook2.handlePreStep({ agent: agent2, messages: [], step: 5 }, async () => d2);
   check('表面状态陈旧 → 推差异而不是全量', out2.messages.length === 2 && /已更新：/.test(out2.messages[1].content[0].text), out2.messages.map((m) => m.content[0].text.slice(0, 20)).join(' | '));
+}
+
+/* --------------------------------------------------------- 到期复核提醒 */
+section('到期复核（verify_when）：会话内提醒一次，且绝不污染差分状态');
+{
+  const steady = fakeCreateMessage('全量', [{ id: 'a', hash: 'h1' }]);
+  const userTurn = { id: 'u1', source: { kind: 'user' }, content: [{ type: 'text', text: '继续' }] };
+
+  // ① 一条已到期的条目 → 零注入的那一轮发出 due 提醒
+  {
+    // 记忆没变化（previous 与当前一致）→ plan 是 none，正好是到期提醒该出场的时机
+    const entries = { current: [entry('a', 'h1', { date: '2026-01-01', verifyWhen: '2026-01-10', line: '该复核的结论' })] };
+    const hook = makeHook(entries, { today: () => '2026-03-01' });
+    const agent = fakeAgent();
+    const claimed = [userTurn, steady];
+    const decision = { kind: 'ok', messages: [...claimed] };
+
+    const out = await hook.handlePreStep({ agent, messages: claimed, step: 2 }, async () => decision);
+    check('零注入的那一轮插入了到期提醒', out.messages.length === decision.messages.length + 1, String(out.messages.length));
+    const dueMsg = out.messages.find((m) => m.source?.form === 'due');
+    check('提醒消息带 form=due', !!dueMsg, JSON.stringify(out.messages.map((m) => m.source)));
+    // 关键回归：提醒**不能**带 entries，否则会被当成上一轮状态、把差分基线清零
+    check('提醒不带 entries（source.entries 是 undefined）', dueMsg && dueMsg.source.entries === undefined, JSON.stringify(dueMsg?.source));
+    check('提醒**不是**携带状态的消息', dueMsg && !('entries' in dueMsg.source), JSON.stringify(dueMsg?.source));
+    check('提醒文案含结论正文', !!dueMsg && dueMsg.content[0].text.includes('该复核的结论'), dueMsg?.content[0].text.slice(0, 120));
+    check('提醒文案含「已超期」', !!dueMsg && /已超期 \d+ 天/.test(dueMsg.content[0].text), dueMsg?.content[0].text.slice(0, 200));
+    check('提醒插在已领取消息之后', out.messages.indexOf(dueMsg) === decision.messages.length, String(out.messages.indexOf(dueMsg)));
+
+    // ② 下一步：会话里已经能看到这条提醒 → 不再重复
+    const visible = [...out.messages];
+    const d2 = { kind: 'ok', messages: [...visible] };
+    const out2 = await hook.handlePreStep({ agent, messages: visible, step: 3 }, async () => d2);
+    check('同一会话不重复提醒', out2.messages.length === d2.messages.length, String(out2.messages.length));
+    check('不重复时 decision 原样返回', out2 === d2);
+
+    // ③ 关键回归：提醒之后差分状态没被清零（下一轮不能全量重灌）
+    const d3 = { kind: 'ok', messages: [...visible] };
+    const out3 = await hook.handlePreStep({ agent, messages: visible, step: 4 }, async () => d3);
+    check('提醒之后不触发全量重灌', out3 === d3, `len=${out3.messages.length}`);
+  }
+
+  // 会话恢复 / 回放：提醒已落在会话表面上 → 从可见消息里认出来，不再提醒
+  {
+    const entries = { current: [entry('a', 'h1', { date: '2026-01-01', verifyWhen: '2026-01-10', line: '该复核的结论' })] };
+    const hook = makeHook(entries, { today: () => '2026-03-01' });
+    const agent = fakeAgent();
+    const restored = fakeCreateMessage('提醒过了', null, 'due'); // 回放出来的提醒（不带 entries）
+    agent.session.surface = { nodes: [1, 2] };
+    agent.session.eventAt = (s) =>
+      s === 1 ? { type: 'user/message', data: userTurn } : { type: 'user/message', data: restored };
+
+    const decision = { kind: 'ok', messages: [fakeCreateMessage('全量', [{ id: 'a', hash: 'h1' }])] };
+    const out = await hook.handlePreStep({ agent, messages: [], step: 6 }, async () => decision);
+    check('会话恢复场景：表面已有提醒 → 不重复', out === decision, String(out.messages.length));
+  }
+
+  // ④ 没有到期条目 → 什么都不注入
+  {
+    const entries = { current: [entry('a', 'h1', { date: '2026-01-01', verifyWhen: '2099-01-01' })] };
+    const hook = makeHook(entries, { today: () => '2026-03-01' });
+    const agent = fakeAgent();
+    const claimed = [userTurn, steady];
+    const decision = { kind: 'ok', messages: [...claimed] };
+    const out = await hook.handlePreStep({ agent, messages: claimed, step: 2 }, async () => decision);
+    check('未到期的 verify_when 不提醒', out === decision, String(out.messages.length));
+  }
+
+  // 没写 verify_when 的条目当然也不提醒
+  {
+    const entries = { current: [entry('a', 'h1')] };
+    const hook = makeHook(entries, { today: () => '2026-03-01' });
+    const agent = fakeAgent();
+    const claimed = [userTurn, steady];
+    const decision = { kind: 'ok', messages: [...claimed] };
+    const out = await hook.handlePreStep({ agent, messages: claimed, step: 2 }, async () => decision);
+    check('没写 verify_when 的条目不提醒', out === decision);
+  }
+
+  // 回归：verify_when 写成**人话**（算不出日期）时绝不触发提醒。
+  // 否则一条 `verify_when: 等换机器时` 会让每个会话都弹一次、而且用户怎么改都消不掉。
+  {
+    const entries = { current: [entry('a', 'h1', { date: '2026-01-01', verifyWhen: '等换机器时', line: '等换机器再说' })] };
+    const hook = makeHook(entries, { today: () => '2026-03-01' });
+    const agent = fakeAgent();
+    const claimed = [userTurn, steady];
+    const decision = { kind: 'ok', messages: [...claimed] };
+    const out = await hook.handlePreStep({ agent, messages: claimed, step: 2 }, async () => decision);
+    check('verify_when 是人话（算不出日期）时不触发到期提醒', out === decision, String(out.messages.length));
+    check('人话写法不误判成"已到期"', !out.messages.some((m) => m.source?.form === 'due'), JSON.stringify(out.messages.map((m) => m.source?.form)));
+    // 就算真的走到了渲染那一步，空列表也必须渲染成空串（不注入空消息）
+    check('renderDue 对空列表返回空串', renderDue([]) === '');
+  }
+
+  // ⑤ 本轮本来就要注入 baseline/delta → 到期提醒不抢那条消息
+  {
+    const entries = { current: [entry('a', 'h1', { date: '2026-01-01', verifyWhen: '2026-01-10' }), entry('b', 'h2', { date: '2026-01-01', verifyWhen: '2026-01-10' })] };
+    const hook = makeHook(entries, { today: () => '2026-03-01' });
+    const agent = fakeAgent();
+    const claimed = [userTurn, fakeCreateMessage('旧的全量', [{ id: 'a', hash: 'h1' }])];
+    const decision = { kind: 'ok', messages: [...claimed] };
+    const out = await hook.handlePreStep({ agent, messages: claimed, step: 2 }, async () => decision);
+    const added = out.messages.filter((m) => m.source?.kind === MEMORY_SOURCE_KIND && m !== claimed[1]);
+    check('desired 不为 null 时只注入 delta', out.messages.length === decision.messages.length + 1, String(out.messages.length));
+    check('这一轮注入的是 delta 而不是 due', added.length === 1 && added[0].source.form === 'delta', JSON.stringify(added.map((m) => m.source.form)));
+    check('delta 没被 due 顶掉', /新增：/.test(added[0].content[0].text), added[0]?.content[0].text.slice(0, 80));
+  }
+
+  // ⑥ 空记忆库 / 加载失败 → 到期提醒这条路也不能把会话拖下水
+  {
+    const hook = makeHook({ current: [] }, { today: () => '2026-03-01' });
+    const agent = fakeAgent();
+    const decision = { kind: 'ok', messages: [userTurn] };
+    const out = await hook.handlePreStep({ agent, messages: [], step: 2 }, async () => decision);
+    check('空记忆库不提醒', out === decision);
+  }
+
+  // ⑦ dueWithin：提前 N 天提醒 —— "还没超期但快了"恰恰是提醒最有用的时候
+  {
+    const soon = { current: [entry('a', 'h1', { date: '2026-01-01', verifyWhen: '2026-03-05', line: '三天后该复核' })] };
+    const claimed = [userTurn, steady];
+    const decision = { kind: 'ok', messages: [...claimed] };
+
+    const strict = makeHook(soon, { today: () => '2026-03-01' });
+    const outStrict = await strict.handlePreStep({ agent: fakeAgent(), messages: claimed, step: 2 }, async () => decision);
+    check('dueWithin 默认 0：还有 4 天才到期 → 不提醒', outStrict === decision, String(outStrict.messages.length));
+
+    const early = makeHook(soon, { today: () => '2026-03-01', dueWithin: 7 });
+    const outEarly = await early.handlePreStep({ agent: fakeAgent(), messages: claimed, step: 2 }, async () => decision);
+    const earlyMsg = outEarly.messages.find((m) => m.source?.form === 'due');
+    check('dueWithin=7：还没到期也提醒', !!earlyMsg, JSON.stringify(outEarly.messages.map((m) => m.source?.form)));
+    check('还没到期时文案说「还有 N 天」', !!earlyMsg && /还有 \d+ 天/.test(earlyMsg.content[0].text), earlyMsg?.content[0].text.slice(0, 160));
+    check('提前提醒同样不带 entries', !!earlyMsg && earlyMsg.source.entries === undefined, JSON.stringify(earlyMsg?.source));
+  }
 }
 
 /* ------------------------------------------------------- 蒸馏提醒（M3 第三块） */
