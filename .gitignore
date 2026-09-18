@@ -12,3 +12,7 @@ node_modules/
 *.bak-memory-*
 *.bak2-memory-*
 *.bak3-memory-*
+
+# 打包产物与临时缓存（npm pack 时用 --cache 指进仓库，免得写到工作区外的 npm-cache）
+*.tgz
+.npm-cache/
